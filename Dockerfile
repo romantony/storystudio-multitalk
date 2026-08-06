@@ -1,0 +1,168 @@
+# InfiniteTalk (audio-driven talking-avatar) RunPod Serverless Dockerfile
+#
+# Built on MeiGen-AI/InfiniteTalk (successor to MeiGen-MultiTalk, same
+# Wan2.1-I2V-14B-480P base). See MULTITALK-IMPLEMENTATION.md's
+# "Update 2026-08-05" section for why InfiniteTalk over MultiTalk, and
+# ~/wan22-14B-fp8-4steps/ for the reference pattern this Dockerfile mirrors
+# (cu128 torch pin, best-effort FlashAttention2 with SDPA fallback).
+FROM runpod/pytorch:1.0.7-cu1290-torch260-ubuntu2204
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    MODEL_PATH=/runpod-volume/multitalk \
+    HF_HOME=/runpod-volume/huggingface \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    libsm6 \
+    libxext6 \
+    libglib2.0-0 \
+    libsndfile1 \
+    git \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+WORKDIR /workspace
+
+# Clone InfiniteTalk's native code — provides the generate_infinitetalk.py
+# pipeline (audio-driven I2V on top of Wan2.1-I2V-14B-480P).
+#
+# NOTE: unlike the wan22-14B-fp8-4steps Dockerfile, we deliberately do NOT
+# apply any source patches here (no wan/__init__.py trim, no rope_apply
+# float64->float32 downcast, no sed on t5.py device calls). Those patches
+# were reverse-engineered against the actual Wan2.2 repo's file layout,
+# which we have not verified against InfiniteTalk's repo (not cloned during
+# this scaffolding pass — see task boundaries). InfiniteTalk is also
+# Wan2.1-based so some of the same float64 RoPE / device-string issues may
+# well exist here too — if VRAM or "device=torch.cuda.current_device()"
+# issues show up during Phase 3 pod testing, port the same two patches from
+# ~/wan22-14B-fp8-4steps/Dockerfile (lines ~30-67, ~28) against the real
+# file paths in this clone.
+RUN git clone --depth 1 https://github.com/MeiGen-AI/InfiniteTalk.git /workspace/infinitetalk
+
+# Pin torch + torchvision to a CUDA 12.8 build. cu128 supports BOTH Blackwell
+# (RTX 5090) and Ada (RTX 6000 Ada / L40S), and runs on any host whose driver
+# supports CUDA >= 12.8 (incl. the 12.9 Ada hosts). Installing torchvision
+# unpinned would otherwise drag in a cu130 torch that needs a CUDA-13 driver
+# many RunPod hosts don't have, crashing torch.cuda init with "driver too old".
+RUN python3 -m pip install --no-cache-dir \
+    torch==2.7.0 torchvision==0.22.0 \
+    --index-url https://download.pytorch.org/whl/cu128 && \
+    python3 -m pip cache purge
+
+# FlashAttention 2 (best-effort). InfiniteTalk (Wan2.1-derived) routes
+# attention to the real flash kernel when `flash_attn` imports; otherwise it
+# falls back to PyTorch SDPA. Try prebuilt wheels matching torch 2.7 / cu12 /
+# cp310 across both C++ ABIs and a few versions. NON-FATAL: a wheel mismatch
+# must not break the build — we confirm activation from the startup log and
+# pin the exact wheel later if needed.
+RUN set +e; \
+    for FA in 2.8.2 2.8.1 2.8.0.post2 2.7.4.post1; do \
+      for ABI in TRUE FALSE; do \
+        URL="https://github.com/Dao-AILab/flash-attention/releases/download/v${FA}/flash_attn-${FA}+cu12torch2.7cxx11abi${ABI}-cp310-cp310-linux_x86_64.whl"; \
+        echo "Trying flash-attn $FA abi=$ABI"; \
+        python3 -m pip install --no-cache-dir "$URL" && break 2; \
+      done; \
+    done; \
+    python3 -c "import flash_attn" 2>/dev/null || \
+      python3 -m pip install --no-cache-dir flash_attn --prefer-binary --no-build-isolation 2>&1 | tail -3; \
+    python3 -c "import flash_attn; print('flash-attn', flash_attn.__version__)" \
+      || echo "flash-attn NOT installed — runtime will use PyTorch SDPA fallback"; \
+    python3 -m pip cache purge; true
+
+# Redirect flash_attention imports to SDPA fallback ONLY when flash_attn is
+# unavailable. If flash_attn installed successfully above, native
+# flash_attention() uses the FA2 kernel and this step is a no-op. Scoped
+# generically across the whole clone (pattern-matches known Wan-family
+# import spellings) since we haven't verified InfiniteTalk's exact file
+# layout — if none of these patterns match, this step is a harmless no-op
+# and SDPA fallback must instead be confirmed/added manually in Phase 3.
+RUN python3 - << 'PYEOF'
+import sys
+try:
+    import flash_attn
+    print(f"flash_attn {flash_attn.__version__} present — native FA2 kernel active, skipping redirect")
+    sys.exit(0)
+except ImportError:
+    pass
+import pathlib
+subs = [
+    ('from .attention import flash_attention',            'from .attention import attention as flash_attention'),
+    ('from ..modules.attention import flash_attention',   'from ..modules.attention import attention as flash_attention'),
+    ('from wan.modules.attention import flash_attention', 'from wan.modules.attention import attention as flash_attention'),
+]
+patched = 0
+for py in pathlib.Path('/workspace/infinitetalk').rglob('*.py'):
+    try:
+        code = py.read_text()
+    except Exception:
+        continue
+    updated = code
+    for old, new in subs:
+        updated = updated.replace(old, new)
+    if updated != code:
+        py.write_text(updated)
+        print(f"  patched {py}")
+        patched += 1
+print(f"flash_attn unavailable — redirected flash_attention→attention() in {patched} file(s) (SDPA fallback)")
+PYEOF
+
+# Core deps shared with the I2V workers, plus audio-conditioning deps
+# (wav2vec2/librosa/soundfile) InfiniteTalk needs on top. See
+# requirements.txt for the pip-only equivalent of this list and notes on
+# which audio packages are confirmed-needed vs best-effort guesses.
+RUN python3 -m pip install --no-cache-dir \
+    transformers==4.51.3 \
+    "diffusers>=0.33.0" \
+    accelerate==1.3.0 \
+    safetensors==0.4.5 \
+    tokenizers==0.21.0 \
+    sentencepiece==0.2.0 \
+    huggingface-hub==0.30.0 \
+    imageio==2.36.1 \
+    imageio-ffmpeg==0.5.1 \
+    pillow==11.0.0 \
+    "numpy>=1.23.5,<2" \
+    ftfy==6.3.1 \
+    easydict \
+    einops \
+    regex \
+    requests==2.32.3 \
+    boto3==1.35.76 \
+    runpod==1.7.5 \
+    filelock \
+    "packaging>=20.0" \
+    tqdm \
+    librosa==0.10.2 \
+    soundfile==0.12.1 \
+    opencv-python-headless==4.10.0.84 \
+    scipy \
+    moviepy==1.0.3 && \
+    python3 -m pip cache purge
+
+# Verify critical packages import and confirm the torch CUDA build is 12.x (not 13.x).
+# Also print torch's C++ ABI + flash-attn status so we can pin the right wheel if missed.
+RUN python3 -c "import runpod, diffusers, torch, torchvision, easydict, librosa, soundfile; \
+print(f'OK — runpod={runpod.__version__} diffusers={diffusers.__version__} torch={torch.__version__} torchvision={torchvision.__version__} cuda={torch.version.cuda}'); \
+print(f'torch cxx11_abi={torch._C._GLIBCXX_USE_CXX11_ABI}'); \
+assert torch.version.cuda.startswith('12'), f'torch CUDA build {torch.version.cuda} requires too-new a driver'" && \
+    (python3 -c "import flash_attn; print('flash-attn', flash_attn.__version__, 'OK')" \
+     || echo "flash-attn not present — SDPA fallback")
+
+# Verify InfiniteTalk source was cloned correctly. Only checks the top-level
+# entrypoint script — we haven't verified the internal package layout
+# (wan/ subpackage names etc.), see model_server.py's TODOs for the
+# assumptions made about importable module paths.
+RUN test -f /workspace/infinitetalk/generate_infinitetalk.py && \
+    echo "InfiniteTalk source OK"
+
+COPY handler_v2.py ./handler.py
+COPY model_server.py ./handler/model_server.py
+
+RUN mkdir -p /workspace/models /workspace/huggingface /workspace/outputs /workspace/handler
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+    CMD python3 -c "print('healthy')" || exit 1
+
+CMD ["python3", "-u", "handler.py"]

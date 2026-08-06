@@ -1,0 +1,54 @@
+# NOTE: the production image also `git clone --depth 1
+# https://github.com/MeiGen-AI/InfiniteTalk.git` into ./infinitetalk. Unlike
+# ~/wan22-14B-fp8-4steps, this Dockerfile does NOT apply any source patches
+# (rope_apply downcast, wan/__init__.py trim, etc) — those were verified
+# against Wan2.2's actual file layout and haven't been re-verified against
+# InfiniteTalk's repo (not cloned during this scaffolding pass). See
+# Dockerfile comments for what to check in Phase 3. This file only covers
+# pip packages.
+
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.7.0
+torchvision==0.22.0
+
+transformers==4.51.3
+diffusers>=0.33.0
+accelerate==1.3.0
+safetensors==0.4.5
+tokenizers==0.21.0
+sentencepiece==0.2.0
+huggingface-hub==0.30.0
+imageio==2.36.1
+imageio-ffmpeg==0.5.1
+pillow==11.0.0
+numpy>=1.23.5,<2
+ftfy==6.3.1
+easydict
+einops
+regex
+requests==2.32.3
+boto3==1.35.76
+runpod==1.7.5
+filelock
+packaging>=20.0
+tqdm
+
+# --- Audio-conditioning deps, on top of the base I2V worker's requirements ---
+# InfiniteTalk/MultiTalk need an audio encoder (chinese-wav2vec2-base, loaded
+# via transformers — already pinned above) plus WAV I/O and resampling.
+# librosa/soundfile/opencv/scipy/moviepy versions below are BEST-EFFORT
+# guesses based on what audio-driven video-gen repos of this shape typically
+# need (WAV loading/resampling, frame<->audio alignment, muxing audio into
+# the output MP4) — NOT confirmed against InfiniteTalk's own requirements.txt,
+# since the real repo wasn't cloned/inspected for this scaffolding pass.
+# Cross-check against /workspace/infinitetalk/requirements.txt (if it ships
+# one) during Phase 3 and reconcile versions.
+librosa==0.10.2
+soundfile==0.12.1
+opencv-python-headless==4.10.0.84
+scipy
+moviepy==1.0.3
+
+# Optional, best-effort: flash_attn (native FA2 kernel). Falls back to
+# PyTorch SDPA automatically if not installed — see Dockerfile for the
+# wheel-URL fallback loop matching torch/cuda/python versions.

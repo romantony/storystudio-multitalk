@@ -1,0 +1,23 @@
+{
+  "format": "infinitetalk-v1",
+  "base_dir": "Wan2.1-I2V-14B-480P",
+  "wav2vec_dir": "chinese-wav2vec2-base",
+  "checkpoints": {
+    "single": {
+      "bf16": "single/infinitetalk.safetensors",
+      "fp8": "quant_models/infinitetalk_single_fp8.safetensors",
+      "fp8_lora": "quant_models/infinitetalk_single_fp8_lora.safetensors",
+      "int8": "quant_models/infinitetalk_single_int8.safetensors",
+      "int8_lora": "quant_models/infinitetalk_single_int8_lora.safetensors"
+    },
+    "multi": {
+      "bf16": "multi/infinitetalk.safetensors",
+      "fp8": "quant_models/infinitetalk_multi_fp8.safetensors",
+      "fp8_lora": "quant_models/infinitetalk_multi_fp8_lora.safetensors",
+      "int8": "quant_models/infinitetalk_multi_int8.safetensors",
+      "int8_lora": "quant_models/infinitetalk_multi_int8_lora.safetensors"
+    }
+  },
+  "t5_fp8": "quant_models/t5_fp8.safetensors",
+  "default_weight_format": "fp8_lora"
+}
