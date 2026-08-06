@@ -634,6 +634,25 @@ class ModelServer:
         # generate_infinitetalk.py's own `wan.InfiniteTalkPipeline(...)` call
         # site): use_usp=False keeps this single-GPU worker off the xfuser
         # import path entirely (see module docstring).
+        #
+        # t5_cpu=False (was True): the first real sampling run crashed with
+        # "AttributeError: 'list' object has no attribute 'dtype'" inside
+        # multitalk_model.py's forward(). Root cause confirmed by reading
+        # T5EncoderModel.__call__ (wan/modules/t5.py:528-535): it ALWAYS
+        # returns a Python list of tensors (one per input string, variable
+        # length so they can't be stacked). generate_infinitetalk()'s
+        # `not t5_cpu` branch calls it with 2 strings at once and unpacks
+        # via `context, context_null = self.text_encoder([...])`, which
+        # correctly yields bare tensors (Python unpacking a 2-list). But the
+        # `t5_cpu=True` branch we were using calls it once per string with a
+        # single-element list `[input_prompt]`, so `context` stays a
+        # 1-ELEMENT LIST — never unwrapped — and generate_infinitetalk()
+        # later does `arg_c = {'context': [context], ...}`, double-wrapping
+        # it. This is a genuine inconsistency in upstream's own two
+        # branches, not something fixable on our end without patching their
+        # source — simplest correct fix is to just not take the buggy
+        # branch. T5 (fp8, ~6.7GB) staying GPU-resident is well within this
+        # card's headroom (model load left ~41GB free per worker logs).
         self.pipe = wan.InfiniteTalkPipeline(
             config=cfg,
             checkpoint_dir=base_dir,
@@ -643,7 +662,7 @@ class ModelServer:
             t5_fsdp=False,
             dit_fsdp=False,
             use_usp=False,
-            t5_cpu=True,
+            t5_cpu=False,
             init_on_cpu=True,
             lora_dir=None,
             lora_scales=None,
