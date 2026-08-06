@@ -15,43 +15,100 @@ single-person and two-person modes"):
   worker implements the plan doc's **option 2** design:
 
     - T5 text encoder, wav2vec2 audio encoder, and VAE stay resident in GPU
-      memory for the life of the process (loaded once).
-    - Only the ~19.5 GB DiT safetensors checkpoint gets swapped, via a
-      `load_state_dict`-style reload, when a job's person-count differs from
+      (T5/VAE) or CPU (wav2vec2 — see below) memory for the life of the
+      process (loaded once).
+    - Only the DiT (`self.pipe.model`, a `WanModel`) gets swapped, via a
+      meta-device-skeleton + `optimum.quanto.requantize()` reload (for the
+      fp8/int8 quant checkpoints) when a job's person-count differs from
       whichever variant ("single" / "multi") is currently loaded. This is a
       few seconds (volume-throughput-bound), not a full cold start
-      (~170-190s) — see ModelServer.load_dit() / _swap_dit_weights().
+      (~170-190s) — see ModelServer.load_dit().
 
   TODO — option 1, NOT implemented here: the plan doc's highest-priority
   open question is whether the `multi` checkpoint alone can serve
   single-person jobs at acceptable quality (populate only person1, omit
-  person2). If confirmed in Phase 3, this entire swap mechanism collapses —
-  load `multi` once at startup and never swap. That test requires a real
-  GPU + the real repo and is explicitly out of scope for this scaffolding
-  pass. Option 2 (below) is the built-in fallback if option 1 doesn't hold.
+  person2). If confirmed, this entire swap mechanism collapses — load
+  `multi` once at startup and never swap. That test requires a real GPU run
+  and is out of scope for this pass. Option 2 (below) is the built-in
+  fallback if option 1 doesn't hold.
 
-IMPORTANT — best-effort port, not verified:
-  The InfiniteTalk repo (github.com/MeiGen-AI/InfiniteTalk) was NOT cloned
-  or inspected while writing this file (out of scope for this scaffolding
-  pass — see task boundaries). Its exact Python package layout (module
-  paths, class names, pipeline method signatures) is UNKNOWN. Everything
-  below that touches InfiniteTalk's own code is a best-effort guess modeled
-  on:
-    (a) the CLI flags/`input_json` schema documented in
-        MULTITALK-IMPLEMENTATION.md's "Acceleration" / "API Design"
-        sections (--ckpt_dir, --wav2vec_dir, --quant_dir, --lora_dir,
-        --sample_steps, --sample_text_guide_scale, --sample_audio_guide_scale,
-        --mode, --num_persistent_param_in_dit, --use_teacache), and
-    (b) the Wan2.1/Wan2.2 code convention that ~/wan22-14B-fp8-4steps
-        already confirms works (a thin generate.py CLI wrapping an
-        importable `wan.WanI2V`-style pipeline class; T5/VAE modules at
-        `wan.modules.t5` / `wan.modules.vae`) — InfiniteTalk forked from
-        that same Wan2.1 lineage, so this is a reasonable starting guess,
-        not a verified fact.
-  Every guess is called out at its point of use below with a comment
-  explaining exactly what to check/fix once the real repo is available
-  (Phase 3). The seams (load_dit(), run_inference(), _import_dit_class())
-  are structured so fixing a wrong guess is a local, one-function change.
+CONFIRMED against the real MeiGen-AI/InfiniteTalk source (generate_infinitetalk.py
++ wan/multitalk.py, read in full):
+  - `import wan; wan.InfiniteTalkPipeline` is the real pipeline class
+    (`wan/__init__.py` does `from .multitalk import InfiniteTalkPipeline`).
+  - The original crash (`ImportError: No module named 'xfuser'`) is
+    explained, and `xfuser` IS a hard, unconditional dependency of
+    `wan.multitalk` — NOT something gated behind `use_usp`. Cloned the real
+    repo and grepped every file: `wan/utils/multitalk_utils.py` and
+    `wan/modules/attention.py` both do a bare, MODULE-LEVEL
+    `from xfuser.core.distributed import (...)` (not inside any `if
+    use_usp:` guard). `multitalk.py` imports the first directly
+    (`from .utils.multitalk_utils import MomentumBuffer, ...`, line ~32),
+    and this file's own `_load_quant_dit_module()`/`_load_bf16_dit_module()`
+    below import `wan.modules.multitalk_model`, which imports
+    `.attention` (triggering the second) at module level too. So merely
+    `import wan` — regardless of `use_usp` — requires `xfuser` to be
+    installed; `requirements.txt`'s `xfuser>=0.4.1` (added alongside this
+    fix, matching InfiniteTalk's own requirements.txt) is a real,
+    non-optional dependency, not a defensive extra. (The `if use_usp:`
+    branches elsewhere, e.g. multitalk.py ~line 250, only gate xfuser's
+    *distributed init calls* — by the time you'd reach those, the module has
+    already been imported regardless.)
+  - The three DiT-loading branches inside `__init__` (quant / bf16-merge /
+    pre-merged-dit_path) are ported below as standalone module-level
+    helpers so `load_dit()` can redo the same dance for a checkpoint swap
+    without re-running the whole pipeline constructor (which would also
+    reload T5/VAE/CLIP unnecessarily).
+  - wav2vec2 is NOT part of the pipeline class at all — it's loaded
+    separately via `custom_init(device, wav2vec_dir)` and, per the real
+    CLI (`custom_init('cpu', args.wav2vec_dir)`), lives on CPU permanently
+    (all audio embedding extraction in `get_embedding()` also defaults to
+    `device='cpu'`). Ported verbatim below.
+  - `input_data['cond_video']` is the correct key even for a still image —
+    InfiniteTalk treats an image as a 1-frame video via
+    `extract_specific_frames()` / `is_video()`.
+  - `generate_infinitetalk()`'s `extra_args` is read for exactly six
+    attributes (grepped the full method body): `use_teacache`,
+    `teacache_thresh`, `size` (used as `model_scale` for teacache_init),
+    `use_apg`, `apg_momentum`, `apg_norm_threshold`. No other CLI-only
+    attribute (e.g. `.mode`, `.scene_seg`) is read inside the method itself
+    — `scene_seg`/`mode` are read by the CLI's own `generate()` driver
+    function to decide clip-splitting/shot-detection *before* calling
+    `generate_infinitetalk()`, not by the method. This worker always does
+    single-clip generation (max_frames_num == frame_num, the CLI's default
+    "clip" mode's effective behavior) — no shot-segmentation, no
+    long-video streaming loop.
+  - `size_buckget` (sic — genuine upstream typo, not ours) selects a
+    bucket table (`ASPECT_RATIO_627` / `ASPECT_RATIO_960`) InfiniteTalk
+    uses internally to pick the actual (H, W) from the input image's
+    aspect ratio; the old `max_area`-based sizing this file used to pass
+    was never a real parameter of the API.
+  - `save_video_ffmpeg(video_tensor, save_path_without_ext, [audio_wav],
+    fps=25, quality=5, high_quality_save=False)` appends ".mp4" itself and
+    writes to `save_path_without_ext + ".mp4"` — ported the exact call
+    below including the stem-stripping this requires.
+
+STILL UNVERIFIED / NOT FULLY WIRED (left as TODOs at point of use):
+  - The bf16 baseline DiT-loading branch (`_load_bf16_dit_module`) needs
+    the base Wan2.1 7-shard `diffusion_pytorch_model-0000{1..7}-of-00007.safetensors`
+    files under `checkpoint_dir`, which `scripts/download_base_encoders.py`
+    does NOT currently fetch. This worker's default weight formats
+    (fp8 / fp8_lora) never hit this branch, but it will fail if a job (or
+    `MULTITALK_WEIGHT_FORMAT=bf16`) requests it until those shards are
+    added to the download script.
+  - The pre-merged single-file `dit_path` branch (`_load_premerged_dit_module`)
+    is ported for completeness but not wired into `checkpoints`/weight_format
+    routing — no "premerged" format exists in format.json yet, and we don't
+    have any of those comfyui/infinitetalk_{single,multi}.safetensors files
+    downloaded. Lower priority per task scope.
+  - VRAM-management device placement when `NUM_PERSISTENT_PARAM_IN_DIT` is
+    unset/None: per the real `__init__`, if `enable_vram_management()` is
+    never called AND `init_on_cpu=True` (our fixed default, matches
+    upstream — there's no CLI flag to change it), the DiT is simply never
+    moved off CPU. This worker defaults `NUM_PERSISTENT_PARAM_IN_DIT=0`
+    (not unset) specifically to avoid ever hitting that path in practice —
+    flagged here since it's a faithful-but-surprising port of upstream
+    behavior, not a bug we introduced.
 """
 import gc
 import json
@@ -61,11 +118,24 @@ import sys
 import time
 import traceback
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
+
+# Lightweight, non-CUDA-touching imports for the audio-preprocessing helpers
+# ported from generate_infinitetalk.py — safe to import eagerly (mirrors
+# that script's own top-of-file imports, which happen before any CUDA
+# device selection since the CLI doesn't pin CUDA_VISIBLE_DEVICES itself).
+import numpy as np
+import librosa
+import pyloudnorm as pyln
+import soundfile as sf
+from einops import rearrange
 
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
+# IMPORTANT: must be set before any torch/wan import (below, and in every
+# function that lazily imports them) — same discipline the file always had.
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 
@@ -76,28 +146,33 @@ if INFINITETALK_PATH not in sys.path:
 MODEL_PATH = os.getenv("MODEL_PATH", "/runpod-volume/multitalk")
 SOCKET_PATH = "/tmp/multitalk_model_server.sock"
 
+TASK = "infinitetalk-14B"  # WAN_CONFIGS / SUPPORTED_SIZES key, confirmed via
+                            # wan/configs/__init__.py
+
 # --- Resolutions -------------------------------------------------------
-# 720p single-GPU support is an open question (MULTITALK-IMPLEMENTATION.md
-# Open Question 3 — upstream README described it as multi-GPU-only /
-# "update forthcoming" at doc-write time). Exposed here for completeness;
-# handler_v2.py may choose to reject it until confirmed in Phase 3.
+# CONFIRMED: InfiniteTalk's `size` param is a bucket-name string
+# ("infinitetalk-480" / "infinitetalk-720"), NOT a max_area int — the old
+# RESOLUTIONS = {"480p": 832*480, ...} here was wrong. `shift` (flow-matching
+# schedule) is a real, separate parameter the CLI hardcodes per size
+# (_validate_args: 7 for -480, 11 for -720) — the old code never had it.
 RESOLUTIONS = {
-    "480p": 832 * 480,
-    "720p": 1280 * 720,
+    "480p": "infinitetalk-480",
+    "720p": "infinitetalk-720",
+}
+SHIFT_BY_SIZE = {
+    "infinitetalk-480": 7.0,
+    "infinitetalk-720": 11.0,
 }
 
 # --- Weight-format parameter deltas -------------------------------------
 # Default (40-step, full-precision-equivalent) sampling vs. the lightx2v-
-# merged 4-step FP8/INT8 "_lora" checkpoints. Mirrors the pattern learned
-# tuning wan22-14B-fp8-4steps: CFG-distilled / step-distilled weights need
-# different guidance scales, not just fewer steps.
-#
-# UNCONFIRMED (MULTITALK-IMPLEMENTATION.md "What's still unverified"):
-# whether the `_lora`-suffixed quant files are really 4-step-ready with just
-# `--quant_dir` (no separate `--lora_dir`), given they're byte-identical in
-# size to their non-`_lora` counterparts (strong circumstantial evidence the
-# LoRA is baked in, but not confirmed at inference time). These are our
-# best-guess defaults per weight format; override via env or per-job params.
+# merged 4-step FP8/INT8 "_lora" checkpoints. CONFIRMED sample_steps=40 /
+# text_guide_scale=5.0 / audio_guide_scale=4.0 are generate_infinitetalk.py's
+# own argparse defaults (--sample_steps None->40, --sample_text_guide_scale
+# 5.0, --sample_audio_guide_scale 4.0). The 4-step lightx2v-LoRA values
+# remain our own best-guess defaults (not in upstream argparse, no lightx2v
+# recipe published for InfiniteTalk specifically) — override via per-job
+# params if wrong.
 WEIGHT_FORMAT_DEFAULTS = {
     "bf16":      {"sample_steps": 40, "text_guidance": 5.0, "audio_guidance": 4.0},
     "fp8":       {"sample_steps": 40, "text_guidance": 5.0, "audio_guidance": 4.0},
@@ -121,13 +196,15 @@ DEFAULT_WEIGHT_FORMAT_BY_VARIANT = (
 )
 
 # Fallback checkpoint layout, used when MODEL_PATH/format.json is absent.
-# Mirrors format.json.example — keep the two in sync. Verified 2026-08-06
-# against huggingface.co/api/models/MeiGen-AI/InfiniteTalk's actual file
-# listing: infinitetalk_single_fp8_lora.safetensors does NOT exist upstream
-# (MULTITALK-IMPLEMENTATION.md's original size table was wrong on this
-# point). Every quant safetensors file also ships a same-named sidecar
-# .json (scale/mapping metadata) — see checkpoint_sidecars below; the loader
-# doesn't fetch these yet (see _load_dit_state_dict's TODO).
+# Mirrors format.json.example — keep the two in sync.
+#
+# CONFIRMED: for quant formats, this path is the FULL PATH to the specific
+# .safetensors file (passed as `quant_dir` to the pipeline / `_load_quant_dit_module`
+# below) — matches multitalk.py's own `load_file(quant_dir)` /
+# `quant_dir.replace('safetensors', 'json')` usage exactly. For "bf16", the
+# path plays the role of `infinitetalk_dir` (the single audio-cross-attn
+# weight file merged on top of the base Wan2.1 7-shard DiT — see
+# _load_bf16_dit_module's TODO on the missing shards download).
 _DEFAULT_FORMAT_CONFIG = {
     "format": "infinitetalk-v1",
     "base_dir": "Wan2.1-I2V-14B-480P",
@@ -147,6 +224,10 @@ _DEFAULT_FORMAT_CONFIG = {
             "int8_lora": "quant_models/infinitetalk_multi_int8_lora.safetensors",
         },
     },
+    # Purely informational now — the real loading code derives the sidecar
+    # json path itself via `quant_dir.replace('safetensors', 'json')`
+    # (see _load_quant_dit_module), it doesn't consult this map. Kept as
+    # documentation / for any download-side tooling that wants it.
     "checkpoint_sidecars": {
         "quant_models/infinitetalk_single_fp8.safetensors": "quant_models/infinitetalk_single_fp8.json",
         "quant_models/infinitetalk_single_int8.safetensors": "quant_models/infinitetalk_single_int8.json",
@@ -174,95 +255,276 @@ def _load_format_config() -> dict:
     return _DEFAULT_FORMAT_CONFIG
 
 
+def _quant_kind_for_format(fmt: str) -> Optional[str]:
+    """"fp8"/"fp8_lora" -> "fp8", "int8"/"int8_lora" -> "int8", "bf16" -> None.
+    CONFIRMED: the `_lora`-suffixed quant files are loaded through the exact
+    same `quant="fp8"`/`quant="int8"` constructor path as their plain
+    counterparts — `InfiniteTalkPipeline.__init__` only accepts `quant` in
+    {"int8", "fp8", None} (raises ValueError otherwise; multitalk.py line
+    ~155), and `lora_dir` is explicitly skipped whenever `quant is not None`
+    (line ~239), so the LoRA must already be baked into the requantized
+    weights — there's no separate "fp8_lora" quant kind upstream."""
+    if fmt.startswith("fp8"):
+        return "fp8"
+    if fmt.startswith("int8"):
+        return "int8"
+    if fmt == "bf16":
+        return None
+    raise ValueError(f"Unknown weight_format {fmt!r}")
+
+
 # ════════════════════════════════════════════════════════════════════════════
-# Best-effort imports for InfiniteTalk's pipeline internals — GUESSES.
-# See module docstring. Fix these once the real repo is cloned (Phase 3).
+# Audio preprocessing — ported near-verbatim from generate_infinitetalk.py
+# (functions of the same name, module-level there too). Adapted only to
+# drop the CLI `args` dependency in favor of explicit parameters.
 # ════════════════════════════════════════════════════════════════════════════
 
-# Candidate (module, class) pairs for InfiniteTalk's audio-conditioned DiT /
-# top-level pipeline class. Following the Wan-family rename pattern the plan
-# doc gives (generate_multitalk.py -> generate_infinitetalk.py), the most
-# likely name is "InfiniteTalkPipeline" in a module named after the project,
-# but we try a couple of plausible alternates too.
-_PIPELINE_IMPORT_CANDIDATES = [
-    ("wan.infinitetalk", "InfiniteTalkPipeline"),
-    ("wan.multitalk", "InfiniteTalkPipeline"),
-    ("infinitetalk", "InfiniteTalkPipeline"),
-]
+def custom_init(device, wav2vec_dir):
+    """CONFIRMED verbatim port of generate_infinitetalk.py's custom_init().
+    Loads the wav2vec2 feature extractor + InfiniteTalk's custom
+    Wav2Vec2Model (src.audio_analysis.wav2vec2, NOT the stock transformers
+    class) — this is entirely separate from the InfiniteTalkPipeline class;
+    the pipeline never touches wav2vec2 itself. Real CLI calls this with
+    device='cpu' and never moves it — the audio encoder stays CPU-resident
+    for the life of the process, matching get_embedding()'s own device='cpu'
+    default below."""
+    import torch  # noqa: F401 (imported for side effect parity / future use)
+    from transformers import Wav2Vec2FeatureExtractor
+    from src.audio_analysis.wav2vec2 import Wav2Vec2Model
+
+    audio_encoder = Wav2Vec2Model.from_pretrained(
+        wav2vec_dir, local_files_only=True).to(device)
+    audio_encoder.feature_extractor._freeze_parameters()
+    wav2vec_feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
+        wav2vec_dir, local_files_only=True)
+    return wav2vec_feature_extractor, audio_encoder
 
 
-def _import_pipeline_class():
-    """Best-effort import of InfiniteTalk's top-level pipeline class (the
-    analogue of wan.image2video.WanI2V in ~/wan22-14B-fp8-4steps). Tries
-    each candidate module path in turn; first successful import wins.
+def loudness_norm(audio_array, sr=16000, lufs=-23):
+    """Verbatim port."""
+    meter = pyln.Meter(sr)
+    loudness = meter.integrated_loudness(audio_array)
+    if abs(loudness) > 100:
+        return audio_array
+    return pyln.normalize.loudness(audio_array, loudness, lufs)
 
-    NOT VERIFIED — update _PIPELINE_IMPORT_CANDIDATES with the real
-    module/class name once the InfiniteTalk repo is inspected. Check
-    generate_infinitetalk.py's own top-of-file imports for the ground truth.
-    """
-    errors = []
-    for module_name, class_name in _PIPELINE_IMPORT_CANDIDATES:
-        try:
-            module = __import__(module_name, fromlist=[class_name])
-            cls = getattr(module, class_name)
-            print(f"Resolved InfiniteTalk pipeline class: {module_name}.{class_name}")
-            return cls
-        except Exception as e:  # noqa: BLE001 - collecting for diagnostics
-            errors.append(f"{module_name}.{class_name}: {e}")
-    raise ImportError(
-        "Could not import InfiniteTalk's pipeline class from any candidate "
-        "module path. This is EXPECTED until the real InfiniteTalk repo is "
-        "cloned and inspected (see model_server.py module docstring) — "
-        "update _PIPELINE_IMPORT_CANDIDATES with the correct module/class "
-        "name from generate_infinitetalk.py's own imports. Errors seen: "
-        + "; ".join(errors)
+
+def extract_audio_from_video(filename, sample_rate):
+    """Verbatim port — used by audio_prepare_single() when a person's audio
+    input is actually a video file (.mp4/.mov/.avi/.mkv)."""
+    import subprocess
+
+    raw_audio_path = filename.split('/')[-1].split('.')[0] + '.wav'
+    ffmpeg_command = [
+        "ffmpeg", "-y", "-i", str(filename),
+        "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "2",
+        str(raw_audio_path),
+    ]
+    subprocess.run(ffmpeg_command, check=True)
+    human_speech_array, sr = librosa.load(raw_audio_path, sr=sample_rate)
+    human_speech_array = loudness_norm(human_speech_array, sr)
+    os.remove(raw_audio_path)
+    return human_speech_array
+
+
+def audio_prepare_single(audio_path, sample_rate=16000):
+    """Verbatim port."""
+    ext = os.path.splitext(audio_path)[1].lower()
+    if ext in ['.mp4', '.mov', '.avi', '.mkv']:
+        return extract_audio_from_video(audio_path, sample_rate)
+    human_speech_array, sr = librosa.load(audio_path, sr=sample_rate)
+    return loudness_norm(human_speech_array, sr)
+
+
+def audio_prepare_multi(left_path, right_path, audio_type, sample_rate=16000):
+    """Verbatim port. `left_path`/`right_path` == 'None' (the literal string)
+    signals that speaker is absent — not used by this worker today (our
+    "multi" variant always has both person1 and person2 paths present by
+    construction, see ModelServer._prepare_audio), but kept for fidelity."""
+    if not (left_path == 'None' or right_path == 'None'):
+        human_speech_array1 = audio_prepare_single(left_path)
+        human_speech_array2 = audio_prepare_single(right_path)
+    elif left_path == 'None':
+        human_speech_array2 = audio_prepare_single(right_path)
+        human_speech_array1 = np.zeros(human_speech_array2.shape[0])
+    elif right_path == 'None':
+        human_speech_array1 = audio_prepare_single(left_path)
+        human_speech_array2 = np.zeros(human_speech_array1.shape[0])
+
+    if audio_type == 'para':
+        new_human_speech1 = human_speech_array1
+        new_human_speech2 = human_speech_array2
+    elif audio_type == 'add':
+        new_human_speech1 = np.concatenate(
+            [human_speech_array1, np.zeros(human_speech_array2.shape[0])])
+        new_human_speech2 = np.concatenate(
+            [np.zeros(human_speech_array1.shape[0]), human_speech_array2])
+    else:
+        raise ValueError(f"Unknown audio_type {audio_type!r} — only 'para' "
+                          f"and 'add' are handled by audio_prepare_multi() "
+                          f"upstream.")
+    sum_human_speechs = new_human_speech1 + new_human_speech2
+    return new_human_speech1, new_human_speech2, sum_human_speechs
+
+
+def get_embedding(speech_array, wav2vec_feature_extractor, audio_encoder,
+                   sr=16000, device='cpu'):
+    """Verbatim port. Returns a (seq_len, num_layers, hidden_dim) CPU
+    tensor — this is what gets torch.save()'d to a .pt file and referenced
+    by path in input_data['cond_audio'][...]."""
+    import torch
+
+    audio_duration = len(speech_array) / sr
+    video_length = audio_duration * 25  # assume 25 fps
+
+    audio_feature = np.squeeze(
+        wav2vec_feature_extractor(speech_array, sampling_rate=sr).input_values
     )
+    audio_feature = torch.from_numpy(audio_feature).float().to(device=device)
+    audio_feature = audio_feature.unsqueeze(0)
+
+    with torch.no_grad():
+        embeddings = audio_encoder(
+            audio_feature, seq_len=int(video_length), output_hidden_states=True)
+
+    if len(embeddings) == 0:
+        print("Fail to extract audio embedding")
+        return None
+
+    audio_emb = torch.stack(embeddings.hidden_states[1:], dim=1).squeeze(0)
+    audio_emb = rearrange(audio_emb, "b s d -> s b d")
+    return audio_emb.cpu().detach()
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# DiT checkpoint swap (option 2) — load_state_dict-style reload
+# DiT checkpoint loading — module-level helpers mirroring the three branches
+# inside InfiniteTalkPipeline.__init__ (multitalk.py ~line 194-234), used by
+# ModelServer.load_dit() to redo a checkpoint swap WITHOUT re-running the
+# whole pipeline constructor (which would also reload T5/VAE/CLIP).
 # ════════════════════════════════════════════════════════════════════════════
 
-def _load_dit_state_dict(checkpoint_path: str) -> dict:
-    """Load a single-file InfiniteTalk DiT checkpoint (bf16, fp8, or int8)
-    into a plain state_dict.
-
-    We deliberately do NOT reimplement anything like wan22-14B-fp8-4steps'
-    FP8Linear wrapper here — per the task scope, InfiniteTalk's FP8/INT8
-    quant formats come as pre-quantized single-file checkpoints from
-    HuggingFace and (per the plan doc) are expected to be loaded via
-    InfiniteTalk's own --quant_dir code path, not a custom dequant wrapper.
-    safetensors.torch.load_file returns whatever dtype each tensor was saved
-    as (float8_e4m3fn tensors included, torch >= 2.1 supports this natively)
-    — the DiT module's own load_state_dict is assumed to handle placing
-    those tensors correctly. If InfiniteTalk's real quant format instead
-    needs a custom loader (e.g. per-channel scale tensors under a different
-    key convention, as lightx2v's Wan2.2 FP8 format does), port the relevant
-    loader from ~/wan22-14B-fp8-4steps/model_server.py
-    (_load_lightx2v_fp8_model) once the real safetensors header is
-    inspected.
-    """
+def _load_quant_dit_module(checkpoint_dir: str, quant_ckpt_path: str):
+    """CONFIRMED verbatim port of the `quant is not None` branch
+    (multitalk.py ~line 194-205): build a meta-device WanModel skeleton from
+    `checkpoint_dir/config.json`, then `requantize()` the real quantized
+    weights from `quant_ckpt_path` (a FULL PATH to one .safetensors file)
+    onto it using the sidecar `.json` quantization map (same basename,
+    `.safetensors` -> `.json`). Returns the quantized WanModel, on CPU
+    (the `device='cpu'` in requantize() is copied verbatim from upstream —
+    VRAM placement is handled afterwards by ModelServer.load_dit(), matching
+    __init__'s own `enable_vram_management()` / `.to(device)` split)."""
+    import torch
     from safetensors.torch import load_file
-    return load_file(checkpoint_path)
+    from optimum.quanto import requantize
+    from wan.modules.multitalk_model import WanModel
+
+    with torch.device("meta"):
+        wan_config = json.load(open(os.path.join(checkpoint_dir, "config.json")))
+        model = WanModel(weight_init=False, **wan_config)
+        torch.cuda.empty_cache()
+
+    model_state_dict = load_file(quant_ckpt_path)
+    map_json_path = quant_ckpt_path.replace("safetensors", "json")
+    model.init_freqs()
+    with open(map_json_path, "r") as f:
+        quantization_map = json.load(f)
+    requantize(model, model_state_dict, quantization_map, device="cpu")
+    return model
+
+
+def _load_bf16_dit_module(checkpoint_dir: str, infinitetalk_path: str, param_dtype):
+    """CONFIRMED port of the `quant is None and dit_path is None` branch
+    (multitalk.py ~line 207-224): merges the base Wan2.1 7-shard DiT
+    safetensors under `checkpoint_dir` with the single InfiniteTalk
+    audio-cross-attn weight file `infinitetalk_path` into one state_dict via
+    plain load_state_dict (no meta-device trick here — matches upstream,
+    which builds `self.model` as a real (non-meta) module for this branch;
+    `init_contexts` is constructed upstream but never actually applied as a
+    context manager for this branch, so we don't apply it here either — this
+    looks like dead code in the real source, ported faithfully rather than
+    "fixed").
+
+    TODO — NOT YET DOWNLOADABLE: needs
+    diffusion_pytorch_model-0000{1..7}-of-00007.safetensors under
+    checkpoint_dir. scripts/download_base_encoders.py does not currently
+    fetch these (only VAE/T5/CLIP encoder files + config.json) — this
+    branch will raise FileNotFoundError until that's added. None of this
+    worker's default weight formats (fp8 / fp8_lora) hit this branch."""
+    from safetensors.torch import load_file
+    from wan.modules.multitalk_model import WanModel
+
+    wan_config = json.load(open(os.path.join(checkpoint_dir, "config.json")))
+    model = WanModel(weight_init=False, **wan_config).to(dtype=param_dtype)
+
+    weight_files = [
+        f"{checkpoint_dir}/diffusion_pytorch_model-0000{i}-of-00007.safetensors"
+        for i in range(1, 8)
+    ] + [infinitetalk_path]
+    merged_state_dict = {}
+    for weight_file in weight_files:
+        merged_state_dict.update(load_file(weight_file))
+    model.load_state_dict(merged_state_dict)
+    return model
+
+
+def _load_premerged_dit_module(checkpoint_dir: str, dit_path: str):
+    """Port of the `dit_path is not None` branch (multitalk.py ~line
+    226-234) — a pre-merged single-file checkpoint (e.g. the repo's
+    comfyui/infinitetalk_{single,multi}.safetensors). LOWER PRIORITY per
+    task scope: implemented for completeness but NOT wired into
+    `checkpoints`/weight_format routing (no "premerged" format exists in
+    format.json yet, and none of these files are downloaded onto the
+    volume). Call manually if this path becomes needed."""
+    import torch
+    from diffusers.models.modeling_utils import no_init_weights, ContextManagers
+    import accelerate
+    from wan.modules.multitalk_model import WanModel
+
+    init_contexts = [no_init_weights(), accelerate.init_empty_weights()]
+    with ContextManagers(init_contexts):
+        wan_config = json.load(open(os.path.join(checkpoint_dir, "config.json")))
+        model = WanModel(weight_init=False, **wan_config)
+    checkpoint_weights = torch.load(dit_path, map_location="cpu")
+    model.load_state_dict(checkpoint_weights["state_dict"])
+    return model
 
 
 class ModelServer:
-    """Holds one resident InfiniteTalk pipeline (T5 + wav2vec2 + VAE + DiT).
-    T5/wav2vec2/VAE never change after load_model(). The DiT is swapped
-    in-place by load_dit() when a job needs a different person-count variant
-    than whatever's currently loaded.
+    """Holds one resident InfiniteTalk pipeline (T5 + VAE + CLIP + DiT) plus
+    the separately-loaded wav2vec2 audio encoder. T5/VAE/CLIP/wav2vec2 never
+    change after load_model(). The DiT (self.pipe.model) is swapped in-place
+    by load_dit() when a job needs a different person-count variant than
+    whatever's currently loaded.
     """
 
     def __init__(self):
-        self.pipe = None                    # InfiniteTalk pipeline instance
+        self.pipe = None                    # wan.InfiniteTalkPipeline instance
+        self.wav2vec_feature_extractor = None
+        self.audio_encoder = None
         self.current_dit_variant: Optional[str] = None  # "single" | "multi"
         self.weight_format: Optional[str] = None  # format of the currently-loaded DiT
         self.format_config = None
         self.device = None
-        self.num_persistent_param_in_dit = int(
-            os.getenv("NUM_PERSISTENT_PARAM_IN_DIT", "0"))
+
+        # CONFIRMED: NOT a constructor kwarg — called separately via
+        # pipe.enable_vram_management(num_persistent_param_in_dit=N) after
+        # construction (see load_model()/load_dit()). Real CLI only calls
+        # it `if args.num_persistent_param_in_dit is not None`; we default
+        # to "0" (aggressive offload, everything else onloaded per-layer
+        # during forward) rather than leaving it unset, since with
+        # init_on_cpu=True (our fixed default, matches upstream — no CLI
+        # flag changes it) an unset value would leave the DiT stranded on
+        # CPU with no VRAM management to move it. See module docstring.
+        _npp_env = os.getenv("NUM_PERSISTENT_PARAM_IN_DIT", "0")
+        self.num_persistent_param_in_dit = (
+            None if _npp_env.strip().lower() in ("", "none") else int(_npp_env)
+        )
+
         self.use_teacache = os.getenv("USE_TEACACHE", "1") not in ("0", "false", "False")
-        self.teacache_thresh = float(os.getenv("TEACACHE_THRESH", "0.3"))
+        self.teacache_thresh = float(os.getenv("TEACACHE_THRESH", "0.2"))  # CLI default 0.2
+        self.use_apg = os.getenv("USE_APG", "0") not in ("0", "false", "False")
+        self.apg_momentum = float(os.getenv("APG_MOMENTUM", "-0.75"))  # CLI default
+        self.apg_norm_threshold = float(os.getenv("APG_NORM_THRESHOLD", "55"))  # CLI default
         self._timings = {}
 
     # ------------------------------------------------------------------
@@ -296,10 +558,15 @@ class ModelServer:
             )
         return str(Path(MODEL_PATH) / rel)
 
+    def _base_dir(self) -> str:
+        return str(Path(MODEL_PATH) / self.format_config["base_dir"])
+
     def load_model(self):
-        """Load T5 + wav2vec2 + VAE + the default DiT variant ("single").
-        Everything except the DiT stays resident for the life of the
-        process; see load_dit() for how the DiT itself gets swapped later.
+        """Load T5 + CLIP + VAE + the default DiT variant ("single") via the
+        real InfiniteTalkPipeline constructor, plus wav2vec2 (loaded
+        separately — see custom_init()). Everything except the DiT stays
+        resident for the life of the process; see load_dit() for how the
+        DiT itself gets swapped later.
         """
         import torch
 
@@ -326,33 +593,56 @@ class ModelServer:
               f"text_guidance={defaults['text_guidance']}, "
               f"audio_guidance={defaults['audio_guidance']})")
 
-        base_dir = str(Path(MODEL_PATH) / self.format_config["base_dir"])
+        base_dir = self._base_dir()
         wav2vec_dir = str(Path(MODEL_PATH) / self.format_config["wav2vec_dir"])
 
         print(f"Loading InfiniteTalk pipeline (base={base_dir}, "
-              f"wav2vec={wav2vec_dir}) — this loads T5/VAE/wav2vec2 "
-              f"(resident) plus the initial 'single' DiT ...")
+              f"wav2vec={wav2vec_dir}) — this loads T5/VAE/CLIP (resident) "
+              f"plus the initial 'single' DiT ...")
         start = time.time()
 
-        PipelineCls = _import_pipeline_class()
+        import wan
+        from wan.configs import WAN_CONFIGS
+        cfg = WAN_CONFIGS[TASK]
 
-        # Best-effort constructor call, modeled on WanI2V's __init__ (device
-        # placement, checkpoint_dir) extended with InfiniteTalk-specific
-        # args from the plan doc's CLI table (wav2vec_dir, quant_dir). Exact
-        # kwarg names are a guess — check generate_infinitetalk.py's own
-        # PipelineCls(...) call site once the real repo is available.
-        self.pipe = PipelineCls(
-            ckpt_dir=base_dir,
-            wav2vec_dir=wav2vec_dir,
-            quant_dir=self._checkpoint_path("single"),
+        quant_kind = _quant_kind_for_format(self.weight_format)
+        if quant_kind is not None:
+            quant_dir_kwarg = self._checkpoint_path("single", self.weight_format)
+            infinitetalk_dir_kwarg = None
+        else:  # "bf16" — see _load_bf16_dit_module's TODO on missing shards
+            quant_dir_kwarg = None
+            infinitetalk_dir_kwarg = self._checkpoint_path("single", "bf16")
+
+        # CONFIRMED constructor kwargs (multitalk.py __init__ signature +
+        # generate_infinitetalk.py's own `wan.InfiniteTalkPipeline(...)` call
+        # site): use_usp=False keeps this single-GPU worker off the xfuser
+        # import path entirely (see module docstring).
+        self.pipe = wan.InfiniteTalkPipeline(
+            config=cfg,
+            checkpoint_dir=base_dir,
+            quant_dir=quant_dir_kwarg,
             device_id=0,
             rank=0,
+            t5_fsdp=False,
+            dit_fsdp=False,
+            use_usp=False,
             t5_cpu=True,
             init_on_cpu=True,
-            num_persistent_param_in_dit=self.num_persistent_param_in_dit,
-            use_teacache=self.use_teacache,
+            lora_dir=None,
+            lora_scales=None,
+            quant=quant_kind,
+            dit_path=None,
+            infinitetalk_dir=infinitetalk_dir_kwarg,
         )
         self.current_dit_variant = "single"
+
+        if self.num_persistent_param_in_dit is not None:
+            self.pipe.vram_management = True
+            self.pipe.enable_vram_management(
+                num_persistent_param_in_dit=self.num_persistent_param_in_dit)
+
+        print("Loading wav2vec2 (CPU-resident, per upstream custom_init('cpu', ...))...")
+        self.wav2vec_feature_extractor, self.audio_encoder = custom_init("cpu", wav2vec_dir)
 
         self._instrument_timing()
 
@@ -366,8 +656,9 @@ class ModelServer:
         """Best-effort per-phase timing wrapper, matching
         ~/wan22-14B-fp8-4steps/model_server.py's _instrument_timing(). Skips
         silently (with a warning) if self.pipe doesn't expose the expected
-        `.vae` / `.text_encoder` attributes — cosmetic only, doesn't block
-        generation."""
+        `.vae` attribute — cosmetic only, doesn't block generation. Note:
+        only vae_encode/vae_decode are wrapped (t5/wav2vec entries in
+        self._timings stay 0.0 always) — same as before this rewrite."""
         self._timings = {"t5": 0.0, "wav2vec": 0.0, "vae_encode": 0.0, "vae_decode": 0.0}
         try:
             vae = self.pipe.vae
@@ -393,14 +684,11 @@ class ModelServer:
     # ------------------------------------------------------------------
 
     def load_dit(self, variant: str, weight_format: Optional[str] = None) -> None:
-        """Swap the resident DiT to `variant` ("single" or "multi") if it
-        isn't already loaded. T5/wav2vec2/VAE are untouched.
-
-        This is the "option 2" swap from MULTITALK-IMPLEMENTATION.md's
-        "Requirement: both single-person and two-person modes" section —
-        see the TODO in this file's module docstring for option 1 (test
-        whether `multi` alone covers single-person jobs, which would make
-        this swap unnecessary).
+        """Swap the resident DiT (`self.pipe.model`) to `variant` ("single"
+        or "multi") if it isn't already loaded. T5/VAE/CLIP/wav2vec2 are
+        untouched. Redoes the exact meta-skeleton + requantize() (or bf16
+        merge) dance InfiniteTalkPipeline.__init__ does for its OWN initial
+        DiT load — see _load_quant_dit_module / _load_bf16_dit_module.
         """
         import torch
 
@@ -413,35 +701,40 @@ class ModelServer:
               f"(format={fmt}): loading {ckpt_path}")
         t0 = time.time()
 
-        # Locate the live DiT submodule on the pipeline. Assumed attribute
-        # name `.model`, matching Wan2.1's WanI2V convention (a single DiT,
-        # no high/low-noise split like Wan2.2's MoE — InfiniteTalk inherits
-        # Wan2.1's non-MoE architecture per the plan doc's base-model
-        # comparison table). Verify against the real pipeline object in
-        # Phase 3; if it's named differently (e.g. `.dit`, `.transformer`),
-        # fix the attribute name here.
-        dit_module = getattr(self.pipe, "model", None)
-        if dit_module is None:
-            raise AttributeError(
-                "InfiniteTalk pipeline has no '.model' attribute — the "
-                "assumed DiT submodule name is wrong. Inspect the real "
-                "pipeline object (dir(self.pipe)) in Phase 3 and fix "
-                "load_dit()'s `getattr(self.pipe, \"model\", None)` call."
-            )
+        quant_kind = _quant_kind_for_format(fmt)
+        if quant_kind is not None:
+            new_model = _load_quant_dit_module(self._base_dir(), ckpt_path)
+        elif fmt == "bf16":
+            new_model = _load_bf16_dit_module(
+                self._base_dir(), ckpt_path, self.pipe.param_dtype)
+        else:
+            raise ValueError(f"Unsupported weight_format for DiT swap: {fmt!r}")
 
-        state_dict = _load_dit_state_dict(ckpt_path)
-        missing, unexpected = dit_module.load_state_dict(state_dict, strict=False)
-        if missing:
-            print(f"    [dit-swap] {len(missing)} missing keys after load "
-                  f"(first 5: {missing[:5]})")
-        if unexpected:
-            print(f"    [dit-swap] {len(unexpected)} unexpected keys after "
-                  f"load (first 5: {unexpected[:5]})")
-        dit_module.to(self.device)
+        # CONFIRMED: mirrors the common tail of __init__ that runs after
+        # both loading branches (multitalk.py ~line 236-238) — unconditional
+        # regardless of quant vs bf16.
+        new_model.eval().requires_grad_(False)
+        from wan.multitalk import to_param_dtype_fp32only
+        to_param_dtype_fp32only(new_model, self.pipe.param_dtype)
 
-        del state_dict
+        old_model = self.pipe.model
+        self.pipe.model = new_model
+        del old_model
         gc.collect()
         torch.cuda.empty_cache()
+
+        if self.num_persistent_param_in_dit is not None:
+            self.pipe.vram_management = True
+            self.pipe.enable_vram_management(
+                num_persistent_param_in_dit=self.num_persistent_param_in_dit)
+        else:
+            # Matches __init__'s `if not init_on_cpu: self.model.to(device)`
+            # — our init_on_cpu is always True, so upstream would actually
+            # leave this on CPU here too. We move it explicitly instead
+            # since NUM_PERSISTENT_PARAM_IN_DIT unset is not our supported
+            # configuration (see module docstring) and stranding the DiT on
+            # CPU would silently break inference.
+            new_model.to(self.device)
 
         self.current_dit_variant = variant
         self.weight_format = fmt
@@ -451,22 +744,52 @@ class ModelServer:
     # Inference
     # ------------------------------------------------------------------
 
+    def _prepare_audio(self, person_audio_paths: dict, audio_type: str,
+                        variant: str, tmp_dir: Path):
+        """Port of generate_infinitetalk.py's generate()'s inline audio-prep
+        block (lines ~600-624 of the CLI): raw wav -> audio_prepare_*() ->
+        get_embedding() -> torch.save() to a .pt file, PLUS a mixed-down
+        "video_audio" wav used later for final muxing. Returns
+        (cond_audio_dict, video_audio_path) ready to drop into input_data.
+        """
+        import torch
+
+        if variant == "multi":
+            new_h1, new_h2, summed = audio_prepare_multi(
+                person_audio_paths["person1"], person_audio_paths["person2"],
+                audio_type)
+            emb1 = get_embedding(new_h1, self.wav2vec_feature_extractor, self.audio_encoder)
+            emb2 = get_embedding(new_h2, self.wav2vec_feature_extractor, self.audio_encoder)
+            emb1_path = str(tmp_dir / "1.pt")
+            emb2_path = str(tmp_dir / "2.pt")
+            torch.save(emb1, emb1_path)
+            torch.save(emb2, emb2_path)
+            video_audio_path = str(tmp_dir / "sum.wav")
+            sf.write(video_audio_path, summed, 16000)
+            return {"person1": emb1_path, "person2": emb2_path}, video_audio_path
+
+        human_speech = audio_prepare_single(person_audio_paths["person1"])
+        emb = get_embedding(human_speech, self.wav2vec_feature_extractor, self.audio_encoder)
+        emb_path = str(tmp_dir / "1.pt")
+        torch.save(emb, emb_path)
+        video_audio_path = str(tmp_dir / "sum.wav")
+        sf.write(video_audio_path, human_speech, 16000)
+        return {"person1": emb_path}, video_audio_path
+
     def run_inference(self, params: dict) -> dict:
         """Run one generation job. `params` mirrors the request dict built
-        by handler_v2.py's send_to_model_server() call.
+        by handler_v2.py's send_to_model_server() call — that internal
+        socket-protocol shape is unchanged by this rewrite (image_path,
+        person_audio_paths, etc.); only what we DO with it below changed.
 
-        Best-effort port of generate_infinitetalk.py's inference path (CLI
-        flags per MULTITALK-IMPLEMENTATION.md's "Acceleration" section) as
-        a single in-process pipe.generate(...) call, instead of hand-rolling
-        a custom diffusion loop the way ~/wan22-14B-fp8-4steps/model_server.py's
-        _lightning_generate() does — we have no verified insight into
-        InfiniteTalk's DiT forward signature / L-RoPE person-binding
-        mechanics, so faithfully reproducing a custom sampling loop for it
-        would be pure fabrication. Delegating to the pipeline's own
-        `.generate()` (assumed to exist, mirroring WanI2V.generate()) is the
-        honest "best-effort port" per the task scope — fix the call
-        signature below once the real repo is available.
+        CONFIRMED port: builds the real `input_data`/`extra_args` shapes
+        (see module docstring) and calls
+        `self.pipe.generate_infinitetalk(...)` — the real DiT forward /
+        L-RoPE / audio cross-attn sampling loop lives entirely inside that
+        method (multitalk.py), we don't reimplement any of it.
         """
+        import shutil
+
         image_path = params["image_path"]
         prompt = params.get("prompt", "")
         person_audio_paths = params["person_audio_paths"]  # {"person1": path, "person2": path?}
@@ -479,7 +802,8 @@ class ModelServer:
 
         if resolution not in RESOLUTIONS:
             raise ValueError(f"Unknown resolution '{resolution}'. Choose 480p or 720p.")
-        max_area = RESOLUTIONS[resolution]
+        size_bucket = RESOLUTIONS[resolution]
+        shift = params.get("shift", SHIFT_BY_SIZE[size_bucket])
 
         # Swap DiT if this job's person-count doesn't match what's resident.
         # Must happen BEFORE reading self.weight_format below — load_dit()
@@ -494,66 +818,98 @@ class ModelServer:
         sample_steps = params.get("sample_steps", defaults["sample_steps"])
         text_guidance = params.get("text_guidance_scale", defaults["text_guidance"])
         audio_guidance = params.get("audio_guidance_scale", defaults["audio_guidance"])
+        motion_frame = params.get("motion_frame", 9)  # CLI's real default (9), not the
+                                                        # method's own signature default (25)
 
-        from PIL import Image
-        image = Image.open(image_path).convert("RGB")
-
-        print(f"Generating {resolution} (variant={variant}), {frame_num} frames, "
-              f"{sample_steps} steps, text_guidance={text_guidance}, "
-              f"audio_guidance={audio_guidance}, audio_type={audio_type}, "
-              f"teacache={self.use_teacache}")
+        print(f"Generating {resolution} (variant={variant}, size={size_bucket}), "
+              f"{frame_num} frames, {sample_steps} steps, shift={shift}, "
+              f"text_guidance={text_guidance}, audio_guidance={audio_guidance}, "
+              f"audio_type={audio_type}, teacache={self.use_teacache}")
 
         self._timings = {"t5": 0.0, "wav2vec": 0.0, "vae_encode": 0.0, "vae_decode": 0.0}
 
-        # Best-effort call signature — kwarg names map directly onto the CLI
-        # flags documented in MULTITALK-IMPLEMENTATION.md's "Acceleration"
-        # section (--sample_steps, --sample_text_guide_scale,
-        # --sample_audio_guide_scale, --mode streaming,
-        # --num_persistent_param_in_dit, --use_teacache) plus the
-        # cond_audio / audio_type fields from the "API Design" section's
-        # input_json schema. NOT VERIFIED against the real pipeline class.
-        video_tensor = self.pipe.generate(
-            input_prompt=prompt,
-            img=image,
-            cond_audio=person_audio_paths,
-            audio_type=audio_type,
-            max_area=max_area,
-            frame_num=frame_num,
-            sample_steps=sample_steps,
-            text_guide_scale=text_guidance,
-            audio_guide_scale=audio_guidance,
-            mode="streaming",
-            num_persistent_param_in_dit=self.num_persistent_param_in_dit,
-            use_teacache=self.use_teacache,
-            teacache_thresh=self.teacache_thresh,
-            seed=-1,
-        )
+        tmp_dir = Path(output_path).parent / f"_infinitetalk_audio_{params.get('job_id', 'job')}"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            cond_audio, video_audio_path = self._prepare_audio(
+                person_audio_paths, audio_type, variant, tmp_dir)
 
-        self._write_video(video_tensor, output_path)
+            # CONFIRMED shape (multitalk.py generate_infinitetalk() reads
+            # exactly these keys): 'cond_video' (NOT 'cond_image', even for
+            # a still image — see module docstring), 'cond_audio' (dict of
+            # embedding .pt PATHS, not tensors/raw wav), 'audio_type',
+            # 'video_audio' (mixed-down wav path used only for final mux).
+            input_data = {
+                "prompt": prompt,
+                "cond_video": image_path,
+                "cond_audio": cond_audio,
+                "audio_type": audio_type,
+                "video_audio": video_audio_path,
+            }
+
+            # CONFIRMED: exactly these 6 attributes are read off extra_args
+            # inside generate_infinitetalk() (grepped the full method body —
+            # no `.mode`/`.scene_seg`/other CLI-only attrs are touched here).
+            extra_args = SimpleNamespace(
+                use_teacache=self.use_teacache,
+                teacache_thresh=self.teacache_thresh,
+                size=size_bucket,
+                use_apg=self.use_apg,
+                apg_momentum=self.apg_momentum,
+                apg_norm_threshold=self.apg_norm_threshold,
+            )
+
+            # max_frames_num=frame_num forces the internal while-loop
+            # (`if max_frames_num <= frame_num: break`) to exit after one
+            # iteration — i.e. the CLI's default "clip" mode behavior
+            # (single clip, no long-video streaming/motion-frame carry-over
+            # across chunks). We don't implement streaming mode.
+            video_tensor = self.pipe.generate_infinitetalk(
+                input_data,
+                size_buckget=size_bucket,  # sic — real upstream kwarg name (typo)
+                motion_frame=motion_frame,
+                frame_num=frame_num,
+                shift=shift,
+                sampling_steps=sample_steps,
+                text_guide_scale=text_guidance,
+                audio_guide_scale=audio_guidance,
+                n_prompt=params.get("negative_prompt", ""),
+                seed=params.get("seed", -1),
+                offload_model=params.get("offload_model", True),
+                max_frames_num=frame_num,
+                color_correction_strength=params.get("color_correction_strength", 0.0),
+                extra_args=extra_args,
+            )
+
+            self._write_video(video_tensor, video_audio_path, output_path)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
         return {"variant": variant, "sample_steps": sample_steps}
 
-    def _write_video(self, video_tensor, output_path: str) -> None:
-        """(C, N, H, W) [-1,1] tensor -> mp4. Same conversion as
-        ~/wan22-14B-fp8-4steps/model_server.py's generate_video(). fps=25
-        per InfiniteTalk's documented duration math (MULTITALK-IMPLEMENTATION.md
-        "Handler responsibilities" — NOT independently confirmed, the doc's
-        own frame/duration numbers are internally inconsistent; re-derive
-        empirically in Phase 3/6 the same way the 113-frame wan22 cap was
-        found via OOM testing, not from docs)."""
-        import imageio
-        import numpy as np
+    def _write_video(self, video_tensor, video_audio_path: str, output_path: str) -> None:
+        """CONFIRMED port of generate_infinitetalk.py's final muxing call:
+        `save_video_ffmpeg(sum_video, save_file_without_ext, [video_audio_path],
+        high_quality_save=False)`. save_video_ffmpeg() appends ".mp4" itself
+        and writes to `save_path + ".mp4"`, so we pass the extension-stripped
+        stem and rename the result back to our own `output_path` if it
+        differs."""
+        from wan.utils.multitalk_utils import save_video_ffmpeg
 
-        frames = (video_tensor.clamp(-1, 1) + 1) / 2
-        frames = frames.permute(1, 2, 3, 0).cpu().float().numpy()
-        frames = (frames * 255).astype(np.uint8)
+        output_path_str = str(output_path)
+        save_stem = (output_path_str[:-4] if output_path_str.lower().endswith(".mp4")
+                     else output_path_str)
 
-        writer = imageio.get_writer(output_path, fps=25, codec="libx264", quality=8)
-        for frame in frames:
-            writer.append_data(frame)
-        writer.close()
+        save_video_ffmpeg(
+            video_tensor, save_stem, [video_audio_path],
+            fps=25, quality=5, high_quality_save=False)
 
-        if not Path(output_path).exists():
-            raise RuntimeError(f"Video not created at {output_path}")
+        produced = save_stem + ".mp4"
+        if produced != output_path_str:
+            os.replace(produced, output_path_str)
+
+        if not Path(output_path_str).exists():
+            raise RuntimeError(f"Video not created at {output_path_str}")
 
     def generate(self, params: dict) -> dict:
         """Top-level entry point called from the socket loop. Wraps

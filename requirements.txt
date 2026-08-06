@@ -6,6 +6,16 @@
 # InfiniteTalk's repo (not cloned during this scaffolding pass). See
 # Dockerfile comments for what to check in Phase 3. This file only covers
 # pip packages.
+#
+# 2026-08-06: first deploy crashed on `_import_pipeline_class()` with
+# "No module named 'xfuser'" — confirmed via
+# raw.githubusercontent.com/MeiGen-AI/InfiniteTalk/main/wan/__init__.py that
+# `wan.multitalk.InfiniteTalkPipeline` (our 2nd import candidate) IS the
+# correct pipeline class/module; the import just failed because xfuser
+# (a multi-GPU distributed-inference package, required unconditionally by
+# wan/__init__.py even for single-GPU use) wasn't installed. Cross-checked
+# the rest of this file against InfiniteTalk's real requirements.txt at the
+# same commit and added everything that was missing below.
 
 --extra-index-url https://download.pytorch.org/whl/cu128
 torch==2.7.0
@@ -33,19 +43,28 @@ filelock
 packaging>=20.0
 tqdm
 
+# --- Direct deps from InfiniteTalk's own requirements.txt (verified 2026-08-06) ---
+xfuser>=0.4.1            # the missing package that crashed the first deploy
+optimum-quanto==0.2.6    # loads the FP8/INT8 quant_models checkpoints
+dashscope
+scikit-image
+loguru
+gradio>=5.0.0
+pyloudnorm
+scenedetect
+decord
+
 # --- Audio-conditioning deps, on top of the base I2V worker's requirements ---
 # InfiniteTalk/MultiTalk need an audio encoder (chinese-wav2vec2-base, loaded
 # via transformers — already pinned above) plus WAV I/O and resampling.
-# librosa/soundfile/opencv/scipy/moviepy versions below are BEST-EFFORT
-# guesses based on what audio-driven video-gen repos of this shape typically
-# need (WAV loading/resampling, frame<->audio alignment, muxing audio into
-# the output MP4) — NOT confirmed against InfiniteTalk's own requirements.txt,
-# since the real repo wasn't cloned/inspected for this scaffolding pass.
-# Cross-check against /workspace/infinitetalk/requirements.txt (if it ships
-# one) during Phase 3 and reconcile versions.
+# librosa/soundfile/scipy below are our own additions (not in InfiniteTalk's
+# requirements.txt) for the handler's own WAV handling — harmless if unused
+# by the pipeline itself. opencv-python-headless/moviepy ARE in InfiniteTalk's
+# requirements.txt (as opencv-python / moviepy==1.0.3) — versions reconciled
+# against the real file.
 librosa==0.10.2
 soundfile==0.12.1
-opencv-python-headless==4.10.0.84
+opencv-python-headless>=4.9.0.80
 scipy
 moviepy==1.0.3
 
