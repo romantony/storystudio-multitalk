@@ -383,8 +383,12 @@ def generate_video(job: Dict[str, Any]) -> Dict[str, Any]:
                 "video_size_mb": video_size_mb,
                 "resolution": resolution,
                 "sample_steps": result.get("sample_steps", sample_steps),
-                "frame_num": frame_num,
-                "duration_s": round(frame_num / 25, 2),
+                # model_server.py may CLAMP frame_num below what was requested
+                # if the input audio is too short (upstream requires the audio
+                # embedding to be strictly longer than frame_num) — report
+                # the actual value used, not just what was asked for.
+                "frame_num": result.get("frame_num", frame_num),
+                "duration_s": round(result.get("frame_num", frame_num) / 25, 2),
                 "variant": result.get("variant"),
             }
 

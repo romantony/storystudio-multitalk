@@ -105,6 +105,17 @@ this card needs the same kind of empirical OOM-boundary testing that found
 `wan22-14B-fp8-4steps`' 113-frame/7s cap (plan doc Phase 6) — not yet done
 here.
 
+**Your audio must be LONGER than the requested `duration_s`, not just as
+long.** Confirmed against `wan/multitalk.py`'s real `generate_infinitetalk()`
+(line ~478): it silently drops an audio embedding if its length isn't
+*strictly greater than* `frame_num`, then asserts every speaker survived
+that filter — fails with `"Aduio file not exists or length not satisfies
+frame nums."` (real upstream typo) otherwise. `model_server.py` now clamps
+`frame_num` down to fit whatever audio was actually provided rather than
+crashing, so a too-short clip degrades to a shorter output video instead of
+a hard failure — but for `duration_s` to be honored as requested, give it
+audio at least ~0.1-0.2s longer than that.
+
 ### Response
 
 ```json

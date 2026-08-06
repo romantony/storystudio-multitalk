@@ -750,7 +750,11 @@ class ModelServer:
         block (lines ~600-624 of the CLI): raw wav -> audio_prepare_*() ->
         get_embedding() -> torch.save() to a .pt file, PLUS a mixed-down
         "video_audio" wav used later for final muxing. Returns
-        (cond_audio_dict, video_audio_path) ready to drop into input_data.
+        (cond_audio_dict, video_audio_path, min_emb_len) ready to drop into
+        input_data — min_emb_len is the shortest embedding's shape[0]
+        (frame-equivalent length) across all speakers, used by run_inference
+        to clamp frame_num (see its CONFIRMED note on multitalk.py's
+        `full_audio_emb.shape[0] <= frame_num: continue` filter).
         """
         import torch
 
@@ -766,7 +770,8 @@ class ModelServer:
             torch.save(emb2, emb2_path)
             video_audio_path = str(tmp_dir / "sum.wav")
             sf.write(video_audio_path, summed, 16000)
-            return {"person1": emb1_path, "person2": emb2_path}, video_audio_path
+            min_emb_len = min(emb1.shape[0], emb2.shape[0])
+            return {"person1": emb1_path, "person2": emb2_path}, video_audio_path, min_emb_len
 
         human_speech = audio_prepare_single(person_audio_paths["person1"])
         emb = get_embedding(human_speech, self.wav2vec_feature_extractor, self.audio_encoder)
@@ -774,7 +779,7 @@ class ModelServer:
         torch.save(emb, emb_path)
         video_audio_path = str(tmp_dir / "sum.wav")
         sf.write(video_audio_path, human_speech, 16000)
-        return {"person1": emb_path}, video_audio_path
+        return {"person1": emb_path}, video_audio_path, emb.shape[0]
 
     def run_inference(self, params: dict) -> dict:
         """Run one generation job. `params` mirrors the request dict built
@@ -831,8 +836,28 @@ class ModelServer:
         tmp_dir = Path(output_path).parent / f"_infinitetalk_audio_{params.get('job_id', 'job')}"
         tmp_dir.mkdir(parents=True, exist_ok=True)
         try:
-            cond_audio, video_audio_path = self._prepare_audio(
+            cond_audio, video_audio_path, min_emb_len = self._prepare_audio(
                 person_audio_paths, audio_type, variant, tmp_dir)
+
+            # CONFIRMED (multitalk.py generate_infinitetalk() line ~478):
+            # `if full_audio_emb.shape[0] <= frame_num: continue` — an audio
+            # embedding is SILENTLY DROPPED if its length isn't STRICTLY
+            # GREATER than frame_num, and the method then asserts every
+            # speaker's embedding survived that filter (line ~482, "Aduio
+            # file not exists or length not satisfies frame nums." — real
+            # upstream typo). Our old frame_num math (duration_s*25 + 1)
+            # guaranteed this assert whenever the source audio was close to
+            # duration_s seconds long, since it asked for MORE frames than
+            # a duration_s-long clip naturally provides. Clamp here using
+            # the ACTUAL embedding length instead of trusting the
+            # client-requested frame_num blindly.
+            if frame_num >= min_emb_len:
+                clamped = max(1, min_emb_len - 1)
+                print(f"[frame_num] requested {frame_num} >= audio embedding "
+                      f"length {min_emb_len} — clamping to {clamped} "
+                      f"(upstream requires audio strictly longer than "
+                      f"frame_num, see multitalk.py's HUMAN_NUMBER assert)")
+                frame_num = clamped
 
             # CONFIRMED shape (multitalk.py generate_infinitetalk() reads
             # exactly these keys): 'cond_video' (NOT 'cond_image', even for
@@ -885,7 +910,7 @@ class ModelServer:
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
-        return {"variant": variant, "sample_steps": sample_steps}
+        return {"variant": variant, "sample_steps": sample_steps, "frame_num": frame_num}
 
     def _write_video(self, video_tensor, video_audio_path: str, output_path: str) -> None:
         """CONFIRMED port of generate_infinitetalk.py's final muxing call:
