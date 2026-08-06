@@ -57,8 +57,23 @@ RUN python3 -m pip install --no-cache-dir \
 # cp310 across both C++ ABIs and a few versions. NON-FATAL: a wheel mismatch
 # must not break the build — we confirm activation from the startup log and
 # pin the exact wheel later if needed.
+#
+# 2026-08-06: restricted to 2.7.4.post1 only (was 2.8.2 first) — xformers==
+# 0.0.30 (a real, undeclared-upstream dependency, see requirements.txt)
+# hard-checks flash_attn.__version__ against the range [2.7.1, 2.7.4] at
+# import time (xformers/ops/fmha/flash.py) and raises ImportError otherwise;
+# a deploy crashed on "Requires Flash-Attention version >=2.7.1,<=2.7.4 but
+# got 2.8.2" once 2.8.2 installed successfully. There IS an env var to
+# bypass the check (XFORMERS_IGNORE_FLASH_VERSION_CHECK=1) but skipping it
+# risks a real runtime API mismatch, not just an import-time nicety —
+# safer to install a version xformers actually declares support for.
+# CONFIRMED via the GitHub releases API that v2.7.4.post1 is the ONLY
+# release in that range that actually published a torch2.7/cp310 wheel —
+# checked v2.7.4, v2.7.3, v2.7.2(.post1), v2.7.1.post4 too and none of them
+# have ANY release assets for our torch/python combo (source-only tags),
+# so this isn't a preference, it's the sole option that exists.
 RUN set +e; \
-    for FA in 2.8.2 2.8.1 2.8.0.post2 2.7.4.post1; do \
+    for FA in 2.7.4.post1; do \
       for ABI in TRUE FALSE; do \
         URL="https://github.com/Dao-AILab/flash-attention/releases/download/v${FA}/flash_attn-${FA}+cu12torch2.7cxx11abi${ABI}-cp310-cp310-linux_x86_64.whl"; \
         echo "Trying flash-attn $FA abi=$ABI"; \
