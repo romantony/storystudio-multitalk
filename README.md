@@ -134,23 +134,66 @@ Layout assumed under `MODEL_PATH` (default `/runpod-volume/multitalk`) — see
 ├── multi/
 │   └── infinitetalk.safetensors           # bf16, multi-person
 ├── quant_models/
-│   ├── infinitetalk_single_fp8.safetensors
-│   ├── infinitetalk_single_fp8_lora.safetensors
+│   ├── infinitetalk_single_fp8.safetensors      # no _lora variant exists for single (verified)
+│   ├── infinitetalk_single_fp8.json             # sidecar metadata, same-named per quant file
+│   ├── infinitetalk_single_int8.safetensors
+│   ├── infinitetalk_single_int8_lora.safetensors
 │   ├── infinitetalk_multi_fp8.safetensors
 │   ├── infinitetalk_multi_fp8_lora.safetensors
-│   ├── infinitetalk_single_int8.safetensors
 │   ├── infinitetalk_multi_int8.safetensors
-│   └── t5_fp8.safetensors
+│   ├── infinitetalk_multi_int8_lora.safetensors
+│   ├── t5_fp8.safetensors
+│   ├── t5_map_fp8.json
+│   └── quant.json
 └── format.json                  # copy from format.json.example
 ```
 
-This layout is inferred from InfiniteTalk's HF repo file tree
-(`huggingface.co/MeiGen-AI/InfiniteTalk`) as described in the plan doc — it
-has NOT been confirmed by an actual download (Phase 2, not done). Download
+This layout is **verified 2026-08-06 against the live HF repo file listing**
+(`huggingface.co/api/models/MeiGen-AI/InfiniteTalk`), via
+`scripts/download_infinitetalk_checkpoints.py` — see that script for the
+exact fetched paths. One correction vs the original plan doc's size table:
+**`infinitetalk_single_fp8_lora.safetensors` does not exist upstream** —
+only `multi` ships a `_lora` fp8 variant, so `single` jobs default to plain
+`fp8` (40 steps) rather than the 4-step LoRA path (see
+`MULTITALK-IMPLEMENTATION.md`'s "Update 2026-08-06" note and
+`format.json.example`'s per-variant `default_weight_format`). Every quant
+`.safetensors` file also ships a same-named sidecar `.json` (scale/mapping
+metadata) that must be downloaded alongside it — `_load_dit_state_dict()` in
+`model_server.py` doesn't consume it yet (TODO, flagged inline). Download
 source: `https://huggingface.co/MeiGen-AI/InfiniteTalk` +
 `https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-480P` +
 `https://huggingface.co/TencentGameMate/chinese-wav2vec2-base` (all Apache
 2.0 / permissive).
+
+### Downloading
+
+Two helper scripts (gitignored, not tracked in this repo — see `scripts/`,
+same convention as `wan22-14B-fp8-4steps`) fetch everything above:
+
+```
+pip install -U huggingface_hub
+python3 scripts/download_infinitetalk_checkpoints.py --dest /workspace/multitalk   # ~47 GB core quant set + format.json
+python3 scripts/download_base_encoders.py            --dest /workspace/multitalk   # ~15 GB VAE/T5/CLIP + wav2vec2
+```
+
+`download_infinitetalk_checkpoints.py`'s default (no flags) fetches only the
+"core" set actually used by `model_server.py`'s default per-variant weight
+formats — `single`'s plain `fp8` + `multi`'s `fp8_lora`, plus the shared
+`t5_fp8` files and each `.safetensors`' sidecar `.json`. Add
+`--all-quant-variants` for the full int8/int8_lora + non-lora multi_fp8 set
+(~+70 GB, only needed for Phase 7's quant-quality comparison), or
+`--include-bf16` for the full-precision `single/`+`multi/` DiTs (~+28 GB,
+needed for Phase 3's baseline correctness test). `download_base_encoders.py`
+fetches CLIP by default (~2.6 GB, unverified whether InfiniteTalk actually
+uses it — see the script's `CLIP_FILES` comment) and can skip it with
+`--no-clip`.
+
+**Mount-point gotcha:** run both on a RunPod CPU/storage Pod with the
+network volume attached, and check `df -h` first — interactive Pods often
+mount the network volume at `/workspace`, while `/runpod-volume` on that
+same Pod is just local ephemeral disk that's wiped when the Pod is deleted.
+Only the Serverless endpoint itself mounts the volume at `/runpod-volume`
+(what `MODEL_PATH` above assumes).
 
 ## Docker Image
 
@@ -175,7 +218,7 @@ boundaries). Once built:
 | Variable | Default | Purpose |
 |---|---|---|
 | `MODEL_PATH` | `/runpod-volume/multitalk` | Root dir for base model + wav2vec2 + DiT checkpoints |
-| `MULTITALK_WEIGHT_FORMAT` | `fp8_lora` | Which DiT quant format to load: `bf16` / `fp8` / `fp8_lora` / `int8` / `int8_lora` |
+| `MULTITALK_WEIGHT_FORMAT` | unset (per-variant default: `fp8` for single, `fp8_lora` for multi) | Force a specific format for BOTH variants: `bf16` / `fp8` / `int8` / `int8_lora` (not `fp8_lora` — single has no such file) |
 | `NUM_PERSISTENT_PARAM_IN_DIT` | `0` | Passed through to InfiniteTalk's own low-VRAM paging flag (`--num_persistent_param_in_dit`); `0` = known-good low-VRAM baseline, raise once correctness is confirmed (plan doc VRAM Budget section) |
 | `USE_TEACACHE` | `1` | Enable InfiniteTalk's TeaCache speedup (`--use_teacache`) |
 | `TEACACHE_THRESH` | `0.3` | TeaCache threshold, upstream-documented range 0.2-0.5 |

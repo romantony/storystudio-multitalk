@@ -1,4 +1,5 @@
 {
+  "_comment": "Verified 2026-08-06 against the live HF repo tree (huggingface.co/api/models/MeiGen-AI/InfiniteTalk) — infinitetalk_single_fp8_lora.safetensors does NOT exist upstream, unlike what MULTITALK-IMPLEMENTATION.md's original size table assumed. 'single' has no *_lora fp8 variant; only 'multi' does. Each quant safetensors file ships with a same-named sidecar .json (scale/mapping metadata) that must be downloaded alongside it.",
   "format": "infinitetalk-v1",
   "base_dir": "Wan2.1-I2V-14B-480P",
   "wav2vec_dir": "chinese-wav2vec2-base",
@@ -6,7 +7,6 @@
     "single": {
       "bf16": "single/infinitetalk.safetensors",
       "fp8": "quant_models/infinitetalk_single_fp8.safetensors",
-      "fp8_lora": "quant_models/infinitetalk_single_fp8_lora.safetensors",
       "int8": "quant_models/infinitetalk_single_int8.safetensors",
       "int8_lora": "quant_models/infinitetalk_single_int8_lora.safetensors"
     },
@@ -18,6 +18,20 @@
       "int8_lora": "quant_models/infinitetalk_multi_int8_lora.safetensors"
     }
   },
+  "checkpoint_sidecars": {
+    "quant_models/infinitetalk_single_fp8.safetensors": "quant_models/infinitetalk_single_fp8.json",
+    "quant_models/infinitetalk_single_int8.safetensors": "quant_models/infinitetalk_single_int8.json",
+    "quant_models/infinitetalk_single_int8_lora.safetensors": "quant_models/infinitetalk_single_int8_lora.json",
+    "quant_models/infinitetalk_multi_fp8.safetensors": "quant_models/infinitetalk_multi_fp8.json",
+    "quant_models/infinitetalk_multi_fp8_lora.safetensors": "quant_models/infinitetalk_multi_fp8_lora.json",
+    "quant_models/infinitetalk_multi_int8.safetensors": "quant_models/infinitetalk_multi_int8.json",
+    "quant_models/infinitetalk_multi_int8_lora.safetensors": "quant_models/infinitetalk_multi_int8_lora.json"
+  },
   "t5_fp8": "quant_models/t5_fp8.safetensors",
-  "default_weight_format": "fp8_lora"
+  "t5_fp8_map": "quant_models/t5_map_fp8.json",
+  "quant_config": "quant_models/quant.json",
+  "default_weight_format": {
+    "single": "fp8",
+    "multi": "fp8_lora"
+  }
 }

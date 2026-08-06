@@ -106,14 +106,28 @@ WEIGHT_FORMAT_DEFAULTS = {
     "int8_lora": {"sample_steps": 4,  "text_guidance": 1.0, "audio_guidance": 2.0},
 }
 
-# Default weight format served by this worker. fp8_lora = InfiniteTalk's
-# officially-published pre-quantized, (probably) LoRA-merged single-file FP8
-# DiT — see MULTITALK-IMPLEMENTATION.md "Update 2026-08-05". Override via
-# MULTITALK_WEIGHT_FORMAT env var (one of WEIGHT_FORMAT_DEFAULTS' keys).
-DEFAULT_WEIGHT_FORMAT = os.getenv("MULTITALK_WEIGHT_FORMAT", "fp8_lora")
+# Default weight format served by this worker, PER variant — "single" has no
+# officially-published fp8_lora file (verified 2026-08-06 against the live
+# HF repo tree; only "multi" ships one), so the two variants default to
+# different formats. See MULTITALK-IMPLEMENTATION.md "Update 2026-08-05" /
+# "Update 2026-08-06". Override via MULTITALK_WEIGHT_FORMAT env var — if
+# set, it applies to BOTH variants (must be a format that exists for both,
+# i.e. not "fp8_lora"), overriding the per-variant defaults below.
+_WEIGHT_FORMAT_ENV_OVERRIDE = os.getenv("MULTITALK_WEIGHT_FORMAT")
+DEFAULT_WEIGHT_FORMAT_BY_VARIANT = (
+    {"single": _WEIGHT_FORMAT_ENV_OVERRIDE, "multi": _WEIGHT_FORMAT_ENV_OVERRIDE}
+    if _WEIGHT_FORMAT_ENV_OVERRIDE
+    else {"single": "fp8", "multi": "fp8_lora"}
+)
 
 # Fallback checkpoint layout, used when MODEL_PATH/format.json is absent.
-# Mirrors format.json.example — keep the two in sync.
+# Mirrors format.json.example — keep the two in sync. Verified 2026-08-06
+# against huggingface.co/api/models/MeiGen-AI/InfiniteTalk's actual file
+# listing: infinitetalk_single_fp8_lora.safetensors does NOT exist upstream
+# (MULTITALK-IMPLEMENTATION.md's original size table was wrong on this
+# point). Every quant safetensors file also ships a same-named sidecar
+# .json (scale/mapping metadata) — see checkpoint_sidecars below; the loader
+# doesn't fetch these yet (see _load_dit_state_dict's TODO).
 _DEFAULT_FORMAT_CONFIG = {
     "format": "infinitetalk-v1",
     "base_dir": "Wan2.1-I2V-14B-480P",
@@ -122,7 +136,6 @@ _DEFAULT_FORMAT_CONFIG = {
         "single": {
             "bf16": "single/infinitetalk.safetensors",
             "fp8": "quant_models/infinitetalk_single_fp8.safetensors",
-            "fp8_lora": "quant_models/infinitetalk_single_fp8_lora.safetensors",
             "int8": "quant_models/infinitetalk_single_int8.safetensors",
             "int8_lora": "quant_models/infinitetalk_single_int8_lora.safetensors",
         },
@@ -134,8 +147,19 @@ _DEFAULT_FORMAT_CONFIG = {
             "int8_lora": "quant_models/infinitetalk_multi_int8_lora.safetensors",
         },
     },
+    "checkpoint_sidecars": {
+        "quant_models/infinitetalk_single_fp8.safetensors": "quant_models/infinitetalk_single_fp8.json",
+        "quant_models/infinitetalk_single_int8.safetensors": "quant_models/infinitetalk_single_int8.json",
+        "quant_models/infinitetalk_single_int8_lora.safetensors": "quant_models/infinitetalk_single_int8_lora.json",
+        "quant_models/infinitetalk_multi_fp8.safetensors": "quant_models/infinitetalk_multi_fp8.json",
+        "quant_models/infinitetalk_multi_fp8_lora.safetensors": "quant_models/infinitetalk_multi_fp8_lora.json",
+        "quant_models/infinitetalk_multi_int8.safetensors": "quant_models/infinitetalk_multi_int8.json",
+        "quant_models/infinitetalk_multi_int8_lora.safetensors": "quant_models/infinitetalk_multi_int8_lora.json",
+    },
     "t5_fp8": "quant_models/t5_fp8.safetensors",
-    "default_weight_format": DEFAULT_WEIGHT_FORMAT,
+    "t5_fp8_map": "quant_models/t5_map_fp8.json",
+    "quant_config": "quant_models/quant.json",
+    "default_weight_format": dict(DEFAULT_WEIGHT_FORMAT_BY_VARIANT),
 }
 
 
@@ -232,7 +256,7 @@ class ModelServer:
     def __init__(self):
         self.pipe = None                    # InfiniteTalk pipeline instance
         self.current_dit_variant: Optional[str] = None  # "single" | "multi"
-        self.weight_format = DEFAULT_WEIGHT_FORMAT
+        self.weight_format: Optional[str] = None  # format of the currently-loaded DiT
         self.format_config = None
         self.device = None
         self.num_persistent_param_in_dit = int(
@@ -245,11 +269,21 @@ class ModelServer:
     # Startup
     # ------------------------------------------------------------------
 
+    def _default_format_for(self, variant: str) -> str:
+        """Per-variant default weight format — "single" has no officially
+        published fp8_lora file, so it defaults to plain "fp8" while "multi"
+        defaults to "fp8_lora". See DEFAULT_WEIGHT_FORMAT_BY_VARIANT."""
+        default_map = self.format_config.get(
+            "default_weight_format", DEFAULT_WEIGHT_FORMAT_BY_VARIANT)
+        if isinstance(default_map, str):  # tolerate an old-style single-string format.json
+            return default_map
+        return default_map[variant]
+
     def _checkpoint_path(self, variant: str, weight_format: Optional[str] = None) -> str:
         """Resolve the absolute on-disk path for a (variant, weight_format)
         pair using the loaded format config (format.json or built-in
         default — see _load_format_config / format.json.example)."""
-        fmt = weight_format or self.weight_format
+        fmt = weight_format or self._default_format_for(variant)
         try:
             rel = self.format_config["checkpoints"][variant][fmt]
         except KeyError:
@@ -284,10 +318,9 @@ class ModelServer:
             raise RuntimeError(f"Model not found at {MODEL_PATH}.")
 
         self.format_config = _load_format_config()
-        self.weight_format = self.format_config.get(
-            "default_weight_format", DEFAULT_WEIGHT_FORMAT)
+        self.weight_format = self._default_format_for("single")
         defaults = WEIGHT_FORMAT_DEFAULTS.get(
-            self.weight_format, WEIGHT_FORMAT_DEFAULTS["fp8_lora"])
+            self.weight_format, WEIGHT_FORMAT_DEFAULTS["fp8"])
         print(f"Weight format: {self.weight_format} "
               f"(default sample_steps={defaults['sample_steps']}, "
               f"text_guidance={defaults['text_guidance']}, "
@@ -371,7 +404,7 @@ class ModelServer:
         """
         import torch
 
-        fmt = weight_format or self.weight_format
+        fmt = weight_format or self._default_format_for(variant)
         if variant == self.current_dit_variant and fmt == self.weight_format:
             return
 
@@ -444,18 +477,23 @@ class ModelServer:
 
         variant = "multi" if "person2" in person_audio_paths else "single"
 
-        defaults = WEIGHT_FORMAT_DEFAULTS.get(
-            self.weight_format, WEIGHT_FORMAT_DEFAULTS["fp8_lora"])
-        sample_steps = params.get("sample_steps", defaults["sample_steps"])
-        text_guidance = params.get("text_guidance_scale", defaults["text_guidance"])
-        audio_guidance = params.get("audio_guidance_scale", defaults["audio_guidance"])
-
         if resolution not in RESOLUTIONS:
             raise ValueError(f"Unknown resolution '{resolution}'. Choose 480p or 720p.")
         max_area = RESOLUTIONS[resolution]
 
         # Swap DiT if this job's person-count doesn't match what's resident.
+        # Must happen BEFORE reading self.weight_format below — load_dit()
+        # updates it to whatever format the target variant actually loaded
+        # in (e.g. "single" defaults to "fp8", "multi" to "fp8_lora"; see
+        # DEFAULT_WEIGHT_FORMAT_BY_VARIANT). Reading it before the swap would
+        # use the PREVIOUSLY loaded variant's format/step-count defaults.
         self.load_dit(variant)
+
+        defaults = WEIGHT_FORMAT_DEFAULTS.get(
+            self.weight_format, WEIGHT_FORMAT_DEFAULTS["fp8"])
+        sample_steps = params.get("sample_steps", defaults["sample_steps"])
+        text_guidance = params.get("text_guidance_scale", defaults["text_guidance"])
+        audio_guidance = params.get("audio_guidance_scale", defaults["audio_guidance"])
 
         from PIL import Image
         image = Image.open(image_path).convert("RGB")

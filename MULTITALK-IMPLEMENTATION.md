@@ -90,6 +90,48 @@ reasoning are unchanged and apply identically to InfiniteTalk.
 
 ---
 
+## Update 2026-08-06 — corrected `quant_models` file listing (single has no `_lora` fp8 file)
+
+Checked the live HF repo listing directly
+(`huggingface.co/api/models/MeiGen-AI/InfiniteTalk`) rather than relying on
+the file table in the "Update 2026-08-05" section above, which turns out to
+be **wrong on one point**: `infinitetalk_single_fp8_lora.safetensors` does
+**not exist** in the repo. The actual `quant_models/` contents are:
+
+```
+infinitetalk_multi_fp8.safetensors        + infinitetalk_multi_fp8.json
+infinitetalk_multi_fp8_lora.safetensors   + infinitetalk_multi_fp8_lora.json
+infinitetalk_multi_int8.safetensors       + infinitetalk_multi_int8.json
+infinitetalk_multi_int8_lora.safetensors  + infinitetalk_multi_int8_lora.json
+infinitetalk_single_fp8.safetensors       + infinitetalk_single_fp8.json
+infinitetalk_single_int8.safetensors      + infinitetalk_single_int8.json
+infinitetalk_single_int8_lora.safetensors + infinitetalk_single_int8_lora.json
+t5_fp8.safetensors + t5_map_fp8.json
+quant.json
+```
+
+Two things this changes:
+1. **Only `multi` has a `_lora` fp8 file.** `single`-person jobs can't use
+   the "official 4-step FP8+LoRA" path at all — they fall back to plain
+   `fp8` (40-step default guidance/steps) or the `int8_lora` file (which
+   does exist for `single`) for a fast path. This also weakens the
+   "already-merged" theory from the 2026-08-05 update, since there was
+   never a same-sized `_lora`/non-`_lora` pair to compare for `single` in
+   the first place — worth re-verifying the merge theory against the
+   `multi` pair specifically once real inference is run.
+2. **Every quant `.safetensors` file ships a same-named sidecar `.json`**
+   (scale/mapping metadata, e.g. `infinitetalk_multi_fp8.json`) not
+   mentioned in the original size table — these need to be downloaded and
+   loaded alongside their `.safetensors` counterpart, not just the big file.
+
+`format.json.example` and `model_server.py`'s fallback config in
+`storystudio-multitalk` have been corrected to match (per-variant
+`default_weight_format`: `single` → `fp8`, `multi` → `fp8_lora`). Loading
+the sidecar `.json` files during DiT swap is still a TODO in
+`_load_dit_state_dict()`.
+
+---
+
 ## What This Is
 
 Audio-driven, multi-person conversational video generation. Given a
