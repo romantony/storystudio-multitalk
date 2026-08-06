@@ -255,6 +255,23 @@ def _load_format_config() -> dict:
     return _DEFAULT_FORMAT_CONFIG
 
 
+def _largest_4np1_at_most(n: int) -> int:
+    """Largest value of the form 4k+1 that is <= n. CONFIRMED requirement
+    (multitalk.py's generate_infinitetalk(), ~line 551-558): the frame mask
+    is built by repeat_interleave-ing frame 0 four times and concatenating
+    the rest (`torch.concat([repeat_interleave(msk[:,0:1], 4), msk[:,1:]])`),
+    giving a temporal length of `frame_num + 3`, which then MUST divide
+    evenly by 4 for `.view(1, T//4, 4, lat_h, lat_w)` to succeed — i.e.
+    `frame_num % 4 == 1`. Also matches the CLI's own `--frame_num` help
+    text ("The number should be 4n+1") and its default of 81 (=4*20+1). A
+    RuntimeError "shape ... is invalid for input of size ..." at that
+    .view() call is this constraint being violated.
+    """
+    if n < 1:
+        raise ValueError(f"No valid 4n+1 frame count <= {n}")
+    return 4 * ((n - 1) // 4) + 1
+
+
 def _quant_kind_for_format(fmt: str) -> Optional[str]:
     """"fp8"/"fp8_lora" -> "fp8", "int8"/"int8_lora" -> "int8", "bf16" -> None.
     CONFIRMED: the `_lora`-suffixed quant files are loaded through the exact
@@ -858,6 +875,18 @@ class ModelServer:
                       f"(upstream requires audio strictly longer than "
                       f"frame_num, see multitalk.py's HUMAN_NUMBER assert)")
                 frame_num = clamped
+
+            # CONFIRMED (multitalk.py ~line 551-558): frame_num MUST be of
+            # the form 4n+1 or the frame-mask .view() call crashes with
+            # "shape [...] is invalid for input of size [...]" — see
+            # _largest_4np1_at_most's docstring. Round DOWN only (never up,
+            # which could put us back over the audio-length clamp above).
+            normalized = _largest_4np1_at_most(frame_num)
+            if normalized != frame_num:
+                print(f"[frame_num] {frame_num} is not of the form 4n+1 "
+                      f"(required by generate_infinitetalk's frame-mask "
+                      f"reshape) — rounding down to {normalized}")
+                frame_num = normalized
 
             # CONFIRMED shape (multitalk.py generate_infinitetalk() reads
             # exactly these keys): 'cond_video' (NOT 'cond_image', even for

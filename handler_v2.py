@@ -64,12 +64,21 @@ KNOWN_AUDIO_TYPES = {"para"}
 # math in MULTITALK-IMPLEMENTATION.md is internally inconsistent (quotes
 # both "15s = 201 frames @ 25fps", which doesn't reconcile arithmetically,
 # and "81 frames optimal for prompt adherence" without stating fps for that
-# figure) — frame_num = duration_s*25 + 1 mirrors the wan22 worker's own
-# frame_num = duration_s*fps + 1 convention as a best guess. Range is
-# intentionally conservative (1-5s) pending the same kind of empirical
-# OOM-boundary testing that found wan22's 113-frame/7s cap
+# figure). Range is intentionally conservative (1-5s) pending the same kind
+# of empirical OOM-boundary testing that found wan22's 113-frame/7s cap
 # (MULTITALK-IMPLEMENTATION.md Phase 6) — NOT yet performed for this worker.
-DURATION_TO_FRAMES = {s: s * 25 + 1 for s in range(1, 6)}
+#
+# CONFIRMED (multitalk.py's generate_infinitetalk(), the frame-mask .view()
+# call): frame_num MUST be of the form 4n+1 (also stated in the CLI's own
+# --frame_num help text) or generation crashes with a shape/reshape
+# RuntimeError — model_server.py's default of 81 (=4*20+1) already
+# satisfies this, but the old `s*25+1` formula here did NOT for any s in
+# 1-5 (e.g. 5*25+1=126, not 4n+1). Rounded down to the nearest 4n+1 <= s*25
+# instead — model_server.py's _largest_4np1_at_most() would catch this too
+# at runtime, but fixing it here means the reported duration_s in job
+# responses matches what was actually requested without needing a
+# server-side correction in the common case.
+DURATION_TO_FRAMES = {s: 4 * ((s * 25 - 1) // 4) + 1 for s in range(1, 6)}
 
 # Global state
 model_server_process = None
