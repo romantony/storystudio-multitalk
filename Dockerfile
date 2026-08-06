@@ -108,37 +108,16 @@ for py in pathlib.Path('/workspace/infinitetalk').rglob('*.py'):
 print(f"flash_attn unavailable — redirected flash_attention→attention() in {patched} file(s) (SDPA fallback)")
 PYEOF
 
-# Core deps shared with the I2V workers, plus audio-conditioning deps
-# (wav2vec2/librosa/soundfile) InfiniteTalk needs on top. See
-# requirements.txt for the pip-only equivalent of this list and notes on
-# which audio packages are confirmed-needed vs best-effort guesses.
-RUN python3 -m pip install --no-cache-dir \
-    transformers==4.51.3 \
-    "diffusers>=0.33.0" \
-    accelerate==1.3.0 \
-    safetensors==0.4.5 \
-    tokenizers==0.21.0 \
-    sentencepiece==0.2.0 \
-    huggingface-hub==0.30.0 \
-    imageio==2.36.1 \
-    imageio-ffmpeg==0.5.1 \
-    pillow==11.0.0 \
-    "numpy>=1.23.5,<2" \
-    ftfy==6.3.1 \
-    easydict \
-    einops \
-    regex \
-    requests==2.32.3 \
-    boto3==1.35.76 \
-    runpod==1.7.5 \
-    filelock \
-    "packaging>=20.0" \
-    tqdm \
-    librosa==0.10.2 \
-    soundfile==0.12.1 \
-    opencv-python-headless==4.10.0.84 \
-    scipy \
-    moviepy==1.0.3 && \
+# Core deps + audio-conditioning deps + InfiniteTalk's own direct
+# dependencies (xfuser, optimum-quanto, etc.) — installed from
+# requirements.txt, the single source of truth. NOTE: this used to be a
+# second, hand-maintained package list duplicated here in the Dockerfile,
+# which silently drifted out of sync with requirements.txt (a live deploy
+# crashed on missing xfuser/pyloudnorm/optimum-quanto etc. that had already
+# been added to requirements.txt but never to this list) — fixed 2026-08-06
+# by deleting the duplicate and installing from the file directly.
+COPY requirements.txt .
+RUN python3 -m pip install --no-cache-dir -r requirements.txt && \
     python3 -m pip cache purge
 
 # Verify critical packages import and confirm the torch CUDA build is 12.x (not 13.x).

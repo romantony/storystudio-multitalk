@@ -7,15 +7,19 @@
 # Dockerfile comments for what to check in Phase 3. This file only covers
 # pip packages.
 #
-# 2026-08-06: first deploy crashed on `_import_pipeline_class()` with
-# "No module named 'xfuser'" — confirmed via
-# raw.githubusercontent.com/MeiGen-AI/InfiniteTalk/main/wan/__init__.py that
-# `wan.multitalk.InfiniteTalkPipeline` (our 2nd import candidate) IS the
-# correct pipeline class/module; the import just failed because xfuser
-# (a multi-GPU distributed-inference package, required unconditionally by
-# wan/__init__.py even for single-GPU use) wasn't installed. Cross-checked
-# the rest of this file against InfiniteTalk's real requirements.txt at the
-# same commit and added everything that was missing below.
+# 2026-08-06: first deploy crashed with "No module named 'xfuser'" (a hard,
+# module-level dependency of wan.multitalk's own import chain — NOT
+# avoidable by staying single-GPU, see model_server.py's module docstring).
+# Cross-checked this file against InfiniteTalk's real requirements.txt and
+# added everything missing below (xfuser, optimum-quanto, etc).
+#
+# A SECOND deploy still crashed on "No module named 'pyloudnorm'" even
+# though it had already been added here — root cause: the Dockerfile had
+# its OWN separate, hand-maintained `pip install` package list that never
+# read this file at all, so nothing added here was ever actually installed.
+# Fixed by making the Dockerfile `pip install -r requirements.txt` directly
+# — this file is now the actual, only source of truth for pip deps, not
+# just documentation.
 
 --extra-index-url https://download.pytorch.org/whl/cu128
 torch==2.7.0
