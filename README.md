@@ -197,11 +197,17 @@ Only the Serverless endpoint itself mounts the volume at `/runpod-volume`
 
 ## Docker Image
 
-Not yet built or pushed. Following the same pattern as
-`wan22-14B-fp8-4steps` (`.github/workflows/docker-build.yml`, Docker Hub via
-`DOCKER_USERNAME`/`DOCKER_TOKEN` secrets), this repo will need its own
-workflow file added once a Docker Hub image name is chosen — not included in
-this scaffolding pass.
+```
+romantony/storystudio-multitalk:latest
+```
+
+Built and pushed to Docker Hub automatically by
+[`.github/workflows/docker-build.yml`](./.github/workflows/docker-build.yml)
+on every push to `main` (or manually via `workflow_dispatch`), mirroring
+`wan22-14B-fp8-4steps`'s CI pattern exactly — same `DOCKER_USERNAME`/
+`DOCKER_TOKEN` repo secrets, same disk-cleanup steps (this image's CUDA
+12.9 base is large enough that the default GitHub-hosted runner needs the
+extra space freed up before the build even starts pulling layers).
 
 ## RunPod Setup
 
