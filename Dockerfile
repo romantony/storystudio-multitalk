@@ -164,6 +164,42 @@ for py in pathlib.Path('/workspace/infinitetalk').rglob('*.py'):
 print(f"Rewrote deprecated autocast() calls -> torch.amp.autocast('cuda', ...) in {patched} file(s)")
 PYEOF
 
+# Remove @torch.compile from calculate_x_ref_attn_map (wan/utils/
+# multitalk_utils.py, the only torch.compile use in the whole repo — grepped
+# to confirm). This function builds the ref_target_masks person-targeting
+# attention map: a Python-level `for class_idx in ...` loop containing a
+# torch_gc() (= torch.cuda.empty_cache() + torch.cuda.ipc_collect(), both
+# GPU-synchronizing) call, wrapping tensor ops whose shapes can vary between
+# calls. That combination — dynamic control flow + host-device sync inside a
+# compiled region — is a known torch.compile/Dynamo recompilation trap:
+# every shape/guard miss forces a full Triton/Inductor recompile, which can
+# cost tens of seconds on its own. Measured step-timing (added separately in
+# model_server.py) showed ~280-300s/step even after confirming the DiT is
+# fully VRAM-resident and flash-attention is active everywhere else — this
+# function, called once per self-attention layer (~40 blocks) per forward
+# pass (up to 4 passes/step), is the next strongest suspect. This patch
+# removes ONLY the decorator; the function runs the identical math eager
+# instead of compiled, so it isolates torch.compile's own overhead as an
+# experiment rather than changing any generation behavior.
+RUN python3 - << 'PYEOF'
+import pathlib
+p = pathlib.Path('/workspace/infinitetalk/wan/utils/multitalk_utils.py')
+code = p.read_text()
+old = "@torch.compile\ndef calculate_x_ref_attn_map("
+new = "def calculate_x_ref_attn_map("
+count = code.count(old)
+if count == 1:
+    p.write_text(code.replace(old, new))
+    print("removed @torch.compile from calculate_x_ref_attn_map")
+elif count == 0:
+    print("WARNING: @torch.compile decorator pattern not found — "
+          "upstream source may have changed, patch is now a no-op, "
+          "check manually")
+else:
+    raise RuntimeError(f"expected exactly 1 occurrence, found {count} — "
+                        f"refusing to patch ambiguously")
+PYEOF
+
 # Core deps + audio-conditioning deps + InfiniteTalk's own direct
 # dependencies (xfuser, optimum-quanto, etc.) — installed from
 # requirements.txt, the single source of truth. NOTE: this used to be a
