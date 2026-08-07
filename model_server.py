@@ -508,6 +508,50 @@ def _load_premerged_dit_module(checkpoint_dir: str, dit_path: str):
     return model
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# Per-step diffusion timing — NOT upstream code. generate_infinitetalk()
+# (multitalk.py ~line 708-709) wraps its denoising loop as
+# `for i in partial(tqdm, total=len(timesteps)-1)(range(...))`, and tqdm
+# normally redraws its bar via bare `\r` (no trailing `\n`) on every update.
+# handler_v2.py's log-forwarding thread reads the model server's stdout with
+# blocking `readline()` calls, which only return on `\n` — so intermediate
+# tqdm updates get silently absorbed into whatever chunk eventually contains
+# a real newline (e.g. the next FutureWarning print), and the only
+# `N/40 ... s/it` line we can rely on seeing is whichever one happens to
+# land on a real line break. That made it impossible to tell, from logs
+# alone, whether a slow-looking run was actually slow or just under-reported
+# by this buffering.
+#
+# _patch_tqdm_for_step_timing() monkeypatches the `tqdm` name inside the
+# already-imported `wan.multitalk` module (Python looks up globals by name
+# at call time, so reassigning this after `import wan` still takes effect
+# for every future generate_infinitetalk() call, including post-DiT-swap
+# ones). The replacement still delegates to the real tqdm for the visual bar
+# / rate math, but also explicitly print()s a flushed, real-newline-
+# terminated line after each step completes, giving an unambiguous
+# per-step wall-clock number independent of tqdm's redraw behavior.
+# ════════════════════════════════════════════════════════════════════════════
+
+def _patch_tqdm_for_step_timing() -> None:
+    import wan.multitalk as _wan_multitalk
+    real_tqdm = _wan_multitalk.tqdm
+
+    def _timed_tqdm(iterable, total=None, **kwargs):
+        bar = real_tqdm(iterable, total=total, **kwargs)
+        start = time.time()
+        prev = start
+        step_idx = 0
+        for item in bar:
+            yield item
+            now = time.time()
+            step_idx += 1
+            print(f"[step-timing] step {step_idx}/{total} took "
+                  f"{now - prev:.2f}s (elapsed {now - start:.2f}s)", flush=True)
+            prev = now
+
+    _wan_multitalk.tqdm = _timed_tqdm
+
+
 class ModelServer:
     """Holds one resident InfiniteTalk pipeline (T5 + VAE + CLIP + DiT) plus
     the separately-loaded wav2vec2 audio encoder. T5/VAE/CLIP/wav2vec2 never
@@ -631,6 +675,8 @@ class ModelServer:
         import wan
         from wan.configs import WAN_CONFIGS
         cfg = WAN_CONFIGS[TASK]
+
+        _patch_tqdm_for_step_timing()
 
         quant_kind = _quant_kind_for_format(self.weight_format)
         if quant_kind is not None:
