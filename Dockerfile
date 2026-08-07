@@ -164,6 +164,64 @@ for py in pathlib.Path('/workspace/infinitetalk').rglob('*.py'):
 print(f"Rewrote deprecated autocast() calls -> torch.amp.autocast('cuda', ...) in {patched} file(s)")
 PYEOF
 
+# Strip the torch_gc() calls (torch.cuda.empty_cache() + torch.cuda.
+# ipc_collect(), both GPU-synchronizing) out of calculate_x_ref_attn_map's
+# hot loop (wan/utils/multitalk_utils.py). Isolated experiment #2 on the
+# ~280-300s/step cost: #1 (removing @torch.compile from this same function)
+# made things WORSE (488s/step), so compilation itself was ruled out as the
+# cause and reverted — that also means eager-mode overhead, not
+# recompilation, dominates when this function runs uncompiled, which points
+# more at the forced syncs than the matmul itself. This function is called
+# once per self-attention layer (~40 blocks) per forward pass (up to 4
+# passes/step), so torch_gc() runs up to ~160 times/step; each call forces a
+# full CUDA sync, which is a known hot-loop anti-pattern independent of
+# whatever GPU it runs on. @torch.compile stays in place this time — only
+# the two torch_gc() call sites are removed (inside the per-class loop, and
+# after it), the surrounding tensor math is untouched. Verified against a
+# scratch clone: patched file py_compile clean, both call sites (and no
+# others) matched exactly once each.
+RUN python3 - << 'PYEOF'
+import pathlib
+p = pathlib.Path('/workspace/infinitetalk/wan/utils/multitalk_utils.py')
+code = p.read_text()
+
+subs = [
+    ("    for class_idx, ref_target_mask in enumerate(ref_target_masks):\n"
+     "        torch_gc()\n"
+     "        ref_target_mask = ref_target_mask[None, None, None, ...]",
+     "    for class_idx, ref_target_mask in enumerate(ref_target_masks):\n"
+     "        ref_target_mask = ref_target_mask[None, None, None, ...]"),
+    ("    del attn\n"
+     "    del x_ref_attn_map_source\n"
+     "    torch_gc()\n"
+     "\n"
+     "    return torch.concat(x_ref_attn_maps, dim=0)",
+     "    del attn\n"
+     "    del x_ref_attn_map_source\n"
+     "\n"
+     "    return torch.concat(x_ref_attn_maps, dim=0)"),
+]
+
+updated = code
+bad = False
+for old, new in subs:
+    count = updated.count(old)
+    if count != 1:
+        print(f"WARNING: expected exactly 1 match, found {count} for a "
+              f"torch_gc() removal pattern — upstream source may have "
+              f"changed, skipping that substitution")
+        bad = True
+        continue
+    updated = updated.replace(old, new)
+
+if updated != code:
+    p.write_text(updated)
+    print("removed torch_gc() calls from calculate_x_ref_attn_map"
+          + (" (partially — see warning above)" if bad else ""))
+else:
+    print("WARNING: no torch_gc() removal applied — check manually")
+PYEOF
+
 # Core deps + audio-conditioning deps + InfiniteTalk's own direct
 # dependencies (xfuser, optimum-quanto, etc.) — installed from
 # requirements.txt, the single source of truth. NOTE: this used to be a
