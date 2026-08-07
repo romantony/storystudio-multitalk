@@ -105,10 +105,12 @@ STILL UNVERIFIED / NOT FULLY WIRED (left as TODOs at point of use):
     unset/None: per the real `__init__`, if `enable_vram_management()` is
     never called AND `init_on_cpu=True` (our fixed default, matches
     upstream — there's no CLI flag to change it), the DiT is simply never
-    moved off CPU. This worker defaults `NUM_PERSISTENT_PARAM_IN_DIT=0`
-    (not unset) specifically to avoid ever hitting that path in practice —
-    flagged here since it's a faithful-but-surprising port of upstream
-    behavior, not a bug we introduced.
+    moved off CPU. This worker defaults `NUM_PERSISTENT_PARAM_IN_DIT=20000000000`
+    (not unset, and comfortably above the ~14B-parameter DiT) specifically
+    to avoid ever hitting that path in practice while still keeping every
+    DiT layer resident in VRAM instead of streamed per-layer on every
+    forward call — see the `0` vs full-residency measurement in
+    ModelServer.__init__'s comment above `_npp_env`.
 """
 import gc
 import json
@@ -527,12 +529,20 @@ class ModelServer:
         # pipe.enable_vram_management(num_persistent_param_in_dit=N) after
         # construction (see load_model()/load_dit()). Real CLI only calls
         # it `if args.num_persistent_param_in_dit is not None`; we default
-        # to "0" (aggressive offload, everything else onloaded per-layer
-        # during forward) rather than leaving it unset, since with
-        # init_on_cpu=True (our fixed default, matches upstream — no CLI
-        # flag changes it) an unset value would leave the DiT stranded on
-        # CPU with no VRAM management to move it. See module docstring.
-        _npp_env = os.getenv("NUM_PERSISTENT_PARAM_IN_DIT", "0")
+        # to a value above the DiT's total param count (~14B) rather than
+        # "0" or leaving it unset. "0" was confirmed (via
+        # src/vram_management/layers.py's enable_vram_management_recursively)
+        # to push EVERY DiT layer into the overflow bucket, which streams
+        # that layer's weights CPU->GPU on every single forward call —
+        # measured at ~288s/it on a 47.5GB RTX 6000 Ada, versus a model that
+        # (T5 ~6.7GB + DiT ~14GB fp8 + VAE/CLIP) fits fully resident with
+        # room to spare. Leaving it unset (None) would skip
+        # enable_vram_management entirely given our `is not None` guard
+        # below, stranding the DiT on CPU since init_on_cpu=True. 20e9 is
+        # comfortably above the 14B-parameter DiT so no layer ever
+        # overflows — every layer gets onloaded to GPU once and stays
+        # resident (see wan/multitalk.py's load_models_to_device()).
+        _npp_env = os.getenv("NUM_PERSISTENT_PARAM_IN_DIT", "20000000000")
         self.num_persistent_param_in_dit = (
             None if _npp_env.strip().lower() in ("", "none") else int(_npp_env)
         )
