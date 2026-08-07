@@ -181,6 +181,14 @@ WEIGHT_FORMAT_DEFAULTS = {
     "int8":      {"sample_steps": 40, "text_guidance": 5.0, "audio_guidance": 4.0},
     "fp8_lora":  {"sample_steps": 4,  "text_guidance": 1.0, "audio_guidance": 2.0},
     "int8_lora": {"sample_steps": 4,  "text_guidance": 1.0, "audio_guidance": 2.0},
+    # Not a real weight_format/quant kind (checkpoint routing and
+    # _quant_kind_for_format both stay keyed on "bf16" — see
+    # ModelServer.fusionx_lora_path) — a separate defaults-lookup key used
+    # only when FUSIONX_LORA_PATH is set, so the bf16 DiT + FusioniX LoRA
+    # combo gets its own (8-step) defaults instead of plain bf16's 40-step
+    # ones. Values from InfiniteTalk's own README: "FusioniX require 8
+    # steps", sample_text_guide_scale=1.0, sample_audio_guide_scale=2.0.
+    "bf16_fusionx": {"sample_steps": 8, "text_guidance": 1.0, "audio_guidance": 2.0},
 }
 
 # Default weight format served by this worker, PER variant — "single" has no
@@ -602,6 +610,28 @@ class ModelServer:
         self.use_apg = os.getenv("USE_APG", "0") not in ("0", "false", "False")
         self.apg_momentum = float(os.getenv("APG_MOMENTUM", "-0.75"))  # CLI default
         self.apg_norm_threshold = float(os.getenv("APG_NORM_THRESHOLD", "55"))  # CLI default
+
+        # Path to the FusioniX distillation LoRA (Wan2.1_I2V_14B_FusionX_LoRA.safetensors,
+        # from vrgamedevgirl84/Wan14BT2VFusioniX). CONFIRMED (wan/multitalk.py
+        # ~line 239): upstream only applies a LoRA when `quant is None`, i.e.
+        # only on the "bf16" path — never fp8/int8. When set, load_model()
+        # passes this through as `lora_dir=[...]`/`lora_scales=[1.0]` to
+        # InfiniteTalkPipeline's constructor instead of the usual
+        # lora_dir=None, and the sampling defaults switch to the
+        # WEIGHT_FORMAT_DEFAULTS["bf16_fusionx"] entry (8 steps) instead of
+        # plain "bf16"'s 40. This worker is expected to be deployed on a
+        # DEDICATED endpoint when this is set — see README's Deployment
+        # section: bf16 T5 (forced, since T5 shares whatever `quant` the
+        # pipeline was built with and never reloads) + bf16 DiT leaves too
+        # little VRAM headroom to also safely serve "multi"/fp8_lora jobs
+        # off the same warm worker.
+        self.fusionx_lora_path = os.getenv("FUSIONX_LORA_PATH") or None
+        if self.fusionx_lora_path:
+            print(f"[fusionx] FUSIONX_LORA_PATH={self.fusionx_lora_path!r} — "
+                  f"will apply as a LoRA on the bf16 DiT "
+                  f"(sample_steps=8, text_guidance=1.0, audio_guidance=2.0 "
+                  f"by default; requires MULTITALK_WEIGHT_FORMAT=bf16)")
+
         self._timings = {}
 
     # ------------------------------------------------------------------
@@ -617,6 +647,15 @@ class ModelServer:
         if isinstance(default_map, str):  # tolerate an old-style single-string format.json
             return default_map
         return default_map[variant]
+
+    def _defaults_for_current_format(self) -> dict:
+        """WEIGHT_FORMAT_DEFAULTS lookup, fusionx-aware. Checkpoint/quant
+        routing always stays keyed on self.weight_format ("bf16", never a
+        made-up "bf16_fusionx" kind) — only the sample_steps/guidance
+        DEFAULTS differ when a FusioniX LoRA is layered on top, so this is
+        the one place that key diverges from self.weight_format."""
+        key = "bf16_fusionx" if self.fusionx_lora_path else self.weight_format
+        return WEIGHT_FORMAT_DEFAULTS.get(key, WEIGHT_FORMAT_DEFAULTS["fp8"])
 
     def _checkpoint_path(self, variant: str, weight_format: Optional[str] = None) -> str:
         """Resolve the absolute on-disk path for a (variant, weight_format)
@@ -663,8 +702,7 @@ class ModelServer:
 
         self.format_config = _load_format_config()
         self.weight_format = self._default_format_for("single")
-        defaults = WEIGHT_FORMAT_DEFAULTS.get(
-            self.weight_format, WEIGHT_FORMAT_DEFAULTS["fp8"])
+        defaults = self._defaults_for_current_format()
         print(f"Weight format: {self.weight_format} "
               f"(default sample_steps={defaults['sample_steps']}, "
               f"text_guidance={defaults['text_guidance']}, "
@@ -715,6 +753,20 @@ class ModelServer:
         # source — simplest correct fix is to just not take the buggy
         # branch. T5 (fp8, ~6.7GB) staying GPU-resident is well within this
         # card's headroom (model load left ~41GB free per worker logs).
+        #
+        # CONFIRMED (wan/multitalk.py ~line 239): `lora_dir`/`lora_scales`
+        # only take effect when `quant is None` (i.e. only on this "bf16"
+        # branch — quant_kind is None here) — harmless to pass them
+        # unconditionally, upstream itself gates on quant, but only
+        # constructing them when there's actually a LoRA configured keeps
+        # the common (non-fusionx) case looking exactly like it did before.
+        if self.fusionx_lora_path:
+            lora_dir_kwarg = [self.fusionx_lora_path]
+            lora_scales_kwarg = [1.0]
+        else:
+            lora_dir_kwarg = None
+            lora_scales_kwarg = None
+
         self.pipe = wan.InfiniteTalkPipeline(
             config=cfg,
             checkpoint_dir=base_dir,
@@ -726,8 +778,8 @@ class ModelServer:
             use_usp=False,
             t5_cpu=False,
             init_on_cpu=True,
-            lora_dir=None,
-            lora_scales=None,
+            lora_dir=lora_dir_kwarg,
+            lora_scales=lora_scales_kwarg,
             quant=quant_kind,
             dit_path=None,
             infinitetalk_dir=infinitetalk_dir_kwarg,
@@ -803,6 +855,15 @@ class ModelServer:
         if quant_kind is not None:
             new_model = _load_quant_dit_module(self._base_dir(), ckpt_path)
         elif fmt == "bf16":
+            # KNOWN GAP: unlike load_model()'s initial pipeline construction,
+            # this swap path does NOT re-apply self.fusionx_lora_path — the
+            # WanLoraWrapper merge (wan/multitalk.py ~line 239) lives only
+            # inside InfiniteTalkPipeline.__init__, not in a reusable method
+            # we can call here. Fine for a dedicated FusioniX-only endpoint
+            # (variant is always "single", so this swap branch never
+            # actually runs after the first load) — would need porting the
+            # LoRA-merge logic here too if "multi" is ever added to such an
+            # endpoint.
             new_model = _load_bf16_dit_module(
                 self._base_dir(), ckpt_path, self.pipe.param_dtype)
         else:
@@ -916,8 +977,7 @@ class ModelServer:
         # use the PREVIOUSLY loaded variant's format/step-count defaults.
         self.load_dit(variant)
 
-        defaults = WEIGHT_FORMAT_DEFAULTS.get(
-            self.weight_format, WEIGHT_FORMAT_DEFAULTS["fp8"])
+        defaults = self._defaults_for_current_format()
         sample_steps = params.get("sample_steps", defaults["sample_steps"])
         text_guidance = params.get("text_guidance_scale", defaults["text_guidance"])
         audio_guidance = params.get("audio_guidance_scale", defaults["audio_guidance"])

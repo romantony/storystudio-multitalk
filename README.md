@@ -239,7 +239,35 @@ boundaries). Once built:
 | `NUM_PERSISTENT_PARAM_IN_DIT` | `20000000000` | Passed through to InfiniteTalk's own low-VRAM paging flag (`--num_persistent_param_in_dit`). `0` streams every DiT layer CPU->GPU on every forward call (measured ~280s/step on a 47.5GB RTX 6000 Ada); the default is set above the ~14B-parameter DiT so the whole model stays GPU-resident instead. If this env var is set explicitly on the RunPod endpoint (e.g. still `0` from before this was raised), that overrides the code default — check the endpoint config, not just this table. |
 | `USE_TEACACHE` | `1` | Enable InfiniteTalk's TeaCache speedup (`--use_teacache`) |
 | `TEACACHE_THRESH` | `0.3` | TeaCache threshold, upstream-documented range 0.2-0.5 |
+| `FUSIONX_LORA_PATH` | unset | Path to `Wan2.1_I2V_14B_FusionX_LoRA.safetensors` (fetched via `download_infinitetalk_checkpoints.py --fusionx-lora`) — applies the FusioniX distillation LoRA on top of the bf16 DiT, cutting `sample_steps` 40->8. Requires `MULTITALK_WEIGHT_FORMAT=bf16` (upstream only merges a LoRA when `quant is None`, i.e. the bf16 path). See "Fast single-person (FusioniX) endpoint" below — deploy this on its own dedicated endpoint, not alongside `multi`/fp8_lora jobs. |
 | `R2_ACCOUNT_ID` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` / `R2_BUCKET_NAME` / `R2_PUBLIC_URL` | see `handler_v2.py` | Cloudflare R2 upload target for generated videos |
+
+### Fast single-person (FusioniX) endpoint
+
+Single-person jobs on the default `fp8` path run 40 sampling steps; the
+FusioniX distillation LoRA cuts that to 8 with much better quality than
+just truncating steps on the non-distilled checkpoint would. It only
+applies on the unquantized bf16 DiT, and T5 shares whatever quantization
+the DiT was built with for the worker's whole lifetime (never reloads) —
+so a worker running FusioniX has bf16 T5 (~11.4GB) + bf16 DiT (~28GB)
+resident, leaving too little VRAM headroom to also safely serve
+`multi`/fp8_lora jobs off the same warm worker. Deploy it as a **second,
+separate** Serverless Endpoint instead (same Docker image):
+
+1. Download the extra files onto the **same** network volume the main
+   endpoint uses:
+   ```
+   python3 scripts/download_base_encoders.py --dest /workspace/multitalk --include-dit-shards
+   python3 scripts/download_infinitetalk_checkpoints.py --dest /workspace/multitalk --include-bf16 --fusionx-lora
+   ```
+2. Create the new endpoint (same image, same volume) with env vars:
+   `MULTITALK_WEIGHT_FORMAT=bf16`,
+   `FUSIONX_LORA_PATH=/runpod-volume/multitalk/loras/Wan2.1_I2V_14B_FusionX_LoRA.safetensors`.
+   Leave `NUM_PERSISTENT_PARAM_IN_DIT` at its default — the 14B param-count
+   threshold it's sized against doesn't depend on dtype.
+3. Watch the first job's model-load VRAM log line for headroom (expect
+   roughly ~41-43GB used against the 44.5-47.5GB hosts seen so far); if it
+   OOMs, lower `NUM_PERSISTENT_PARAM_IN_DIT` on *this* endpoint only.
 
 ## Known gaps / what Phase 3 must verify
 
