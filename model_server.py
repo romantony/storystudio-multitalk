@@ -590,6 +590,12 @@ class ModelServer:
         self.num_persistent_param_in_dit = (
             None if _npp_env.strip().lower() in ("", "none") else int(_npp_env)
         )
+        print(f"[vram-config] NUM_PERSISTENT_PARAM_IN_DIT env var raw={_npp_env!r} "
+              f"-> num_persistent_param_in_dit={self.num_persistent_param_in_dit!r} "
+              f"(0 or a small number here means the DiT will stream CPU->GPU "
+              f"per layer per forward call — this is the #1 suspect for "
+              f"multi-minute/step slowdowns; see model_server.py's module "
+              f"docstring)")
 
         self.use_teacache = os.getenv("USE_TEACACHE", "1") not in ("0", "false", "False")
         self.teacache_thresh = float(os.getenv("TEACACHE_THRESH", "0.2"))  # CLI default 0.2

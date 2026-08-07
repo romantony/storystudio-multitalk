@@ -236,7 +236,7 @@ boundaries). Once built:
 |---|---|---|
 | `MODEL_PATH` | `/runpod-volume/multitalk` | Root dir for base model + wav2vec2 + DiT checkpoints |
 | `MULTITALK_WEIGHT_FORMAT` | unset (per-variant default: `fp8` for single, `fp8_lora` for multi) | Force a specific format for BOTH variants: `bf16` / `fp8` / `int8` / `int8_lora` (not `fp8_lora` — single has no such file) |
-| `NUM_PERSISTENT_PARAM_IN_DIT` | `0` | Passed through to InfiniteTalk's own low-VRAM paging flag (`--num_persistent_param_in_dit`); `0` = known-good low-VRAM baseline, raise once correctness is confirmed (plan doc VRAM Budget section) |
+| `NUM_PERSISTENT_PARAM_IN_DIT` | `20000000000` | Passed through to InfiniteTalk's own low-VRAM paging flag (`--num_persistent_param_in_dit`). `0` streams every DiT layer CPU->GPU on every forward call (measured ~280s/step on a 47.5GB RTX 6000 Ada); the default is set above the ~14B-parameter DiT so the whole model stays GPU-resident instead. If this env var is set explicitly on the RunPod endpoint (e.g. still `0` from before this was raised), that overrides the code default — check the endpoint config, not just this table. |
 | `USE_TEACACHE` | `1` | Enable InfiniteTalk's TeaCache speedup (`--use_teacache`) |
 | `TEACACHE_THRESH` | `0.3` | TeaCache threshold, upstream-documented range 0.2-0.5 |
 | `R2_ACCOUNT_ID` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` / `R2_BUCKET_NAME` / `R2_PUBLIC_URL` | see `handler_v2.py` | Cloudflare R2 upload target for generated videos |
