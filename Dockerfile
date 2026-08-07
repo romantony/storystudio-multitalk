@@ -123,6 +123,47 @@ for py in pathlib.Path('/workspace/infinitetalk').rglob('*.py'):
 print(f"flash_attn unavailable — redirected flash_attention→attention() in {patched} file(s) (SDPA fallback)")
 PYEOF
 
+# Rewrite deprecated torch.cuda.amp.autocast()/amp.autocast() call sites to
+# the non-deprecated torch.amp.autocast('cuda', ...) form. Purely cosmetic
+# (both APIs are functionally identical — torch.cuda.amp.autocast is just a
+# 'cuda'-pinned wrapper around torch.amp.autocast) but the FutureWarning
+# these throw on every autocast entry was flooding worker logs badly enough
+# to obscure real signal (e.g. actual step-timing/error lines) during
+# debugging. Two ordered passes since a plain global substitution would
+# double-patch: pass 1 handles the fully-qualified `torch.cuda.amp.autocast(`
+# form (clip.py only); pass 2 handles the bare `amp.autocast(` form used
+# everywhere else via `import torch.cuda.amp as amp`, with a negative
+# lookbehind so it skips the `torch.amp.autocast(` text pass 1 just wrote
+# (that new text also contains the substring `amp.autocast(`, which would
+# otherwise get matched again as a false positive and mangled into
+# `torch.torch.amp.autocast(...)`). Verified against a scratch clone of this
+# same repo — all 10 affected files (model.py, multitalk_model.py, vae.py,
+# clip.py, vace.py/vace_model.py, image2video.py, text2video.py,
+# first_last_frame2video.py, xdit_context_parallel.py) py_compile clean
+# after patching, decorator form (@amp.autocast(enabled=False)) and
+# multi-line call form both handled correctly.
+RUN python3 - << 'PYEOF'
+import pathlib
+import re
+
+qualified_re = re.compile(r'torch\.cuda\.amp\.autocast\(')
+bare_re = re.compile(r'(?<!torch\.)amp\.autocast\(')
+
+patched = 0
+for py in pathlib.Path('/workspace/infinitetalk').rglob('*.py'):
+    try:
+        code = py.read_text()
+    except Exception:
+        continue
+    updated = qualified_re.sub("torch.amp.autocast('cuda', ", code)
+    updated = bare_re.sub("torch.amp.autocast('cuda', ", updated)
+    if updated != code:
+        py.write_text(updated)
+        print(f"  patched {py}")
+        patched += 1
+print(f"Rewrote deprecated autocast() calls -> torch.amp.autocast('cuda', ...) in {patched} file(s)")
+PYEOF
+
 # Core deps + audio-conditioning deps + InfiniteTalk's own direct
 # dependencies (xfuser, optimum-quanto, etc.) — installed from
 # requirements.txt, the single source of truth. NOTE: this used to be a
